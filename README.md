@@ -59,21 +59,52 @@ Our core developers have been building time-series data platforms for years. Bas
 
 * **Easy horizontal scaling**
 
+```
+更加容易的进行水平扩展
+```
+
   Seamless scalability from a standalone binary at edge to a robust, highly available distributed cluster in cloud, with a transparent experience for both developers and administrators.
 
 * **Analyzing time-series data**
 
+```
+支持时序数据的分析
+```
+
   Query your time-series data with SQL and PromQL. Use Python scripts to facilitate complex analytical tasks.
+
+  ```
+  支持多种查询方式，比如 SQL、PromQL，同时支持 Python 脚本进行复杂的分析任务
+  ```
 
 * **Cloud-native distributed database**
 
+```
+云原生分布式数据库
+```
+
   Fully open-source distributed cluster architecture that harnesses the power of cloud-native elastic computing resources.
+
+  ```
+    完全开源的分布式集群架构，并且充分利用了云的弹性扩展能力 
+  ```
 
 * **Performance and Cost-effective**
 
+```
+性能和成本
+```
+
   Flexible indexing capabilities and distributed, parallel-processing query engine, tackling high cardinality issues down. Optimized columnar layout for handling time-series data; compacted, compressed, and stored on various storage backends, particularly cloud object storage with 50x cost efficiency.
 
+```
+  灵活的创建索引能力和分布式并行处理查询引擎，解决了高基数问题。优化的列式布局处理时序数据；压缩和存储在各种存储后端，特别是云对象存储，成本效率提高了 50 倍
+```
+
 * **Compatible with InfluxDB, Prometheus and more protocols**
+```
+兼容性，支持 InfluxDB、Prometheus 等协议
+```
 
   Widely adopted database protocols and APIs, including MySQL, PostgreSQL, and Prometheus Remote Storage, etc. [Read more](https://docs.greptime.com/user-guide/clients/overview).
 
@@ -134,16 +165,16 @@ cargo run -- standalone start
 
 ### Dashboard
 
-- [The dashboard UI for GreptimeDB](https://github.com/GreptimeTeam/dashboard)
+* [The dashboard UI for GreptimeDB](https://github.com/GreptimeTeam/dashboard)
 
 ### SDK
 
-- [GreptimeDB Go Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-go)
-- [GreptimeDB Java Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-java)
-- [GreptimeDB C++ Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-cpp)
-- [GreptimeDB Erlang Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-erl)
-- [GreptimeDB Rust Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-rust)
-- [GreptimeDB JavaScript Ingester](https://github.com/GreptimeTeam/greptime-ingester-js)
+* [GreptimeDB Go Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-go)
+* [GreptimeDB Java Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-java)
+* [GreptimeDB C++ Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-cpp)
+* [GreptimeDB Erlang Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-erl)
+* [GreptimeDB Rust Ingester](https://github.com/GreptimeTeam/greptimedb-ingester-rust)
+* [GreptimeDB JavaScript Ingester](https://github.com/GreptimeTeam/greptime-ingester-js)
 
 ### Grafana Dashboard
 
@@ -162,15 +193,15 @@ ask for help by filling an issue with a detailed description of what you were tr
 and what went wrong. If you have any questions or if you would like to get involved in our
 community, please check out:
 
-- GreptimeDB Community on [Slack](https://greptime.com/slack)
-- GreptimeDB [GitHub Discussions forum](https://github.com/GreptimeTeam/greptimedb/discussions)
-- Greptime official [website](https://greptime.com)
+* GreptimeDB Community on [Slack](https://greptime.com/slack)
+* GreptimeDB [GitHub Discussions forum](https://github.com/GreptimeTeam/greptimedb/discussions)
+* Greptime official [website](https://greptime.com)
 
 In addition, you may:
 
-- View our official [Blog](https://greptime.com/blogs/)
-- Connect us with [Linkedin](https://www.linkedin.com/company/greptime/)
-- Follow us on [Twitter](https://twitter.com/greptime)
+* View our official [Blog](https://greptime.com/blogs/)
+* Connect us with [Linkedin](https://www.linkedin.com/company/greptime/)
+* Follow us on [Twitter](https://twitter.com/greptime)
 
 ## License
 
@@ -183,8 +214,8 @@ Please refer to [contribution guidelines](CONTRIBUTING.md) and [internal concept
 
 ## Acknowledgement
 
-- GreptimeDB uses [Apache Arrow™](https://arrow.apache.org/) as the memory model and [Apache Parquet™](https://parquet.apache.org/) as the persistent file format.
-- GreptimeDB's query engine is powered by [Apache Arrow DataFusion™](https://arrow.apache.org/datafusion/).
-- [Apache OpenDAL™](https://opendal.apache.org) gives GreptimeDB a very general and elegant data access abstraction layer.
-- GreptimeDB's meta service is based on [etcd](https://etcd.io/).
-- GreptimeDB uses [RustPython](https://github.com/RustPython/RustPython) for experimental embedded python scripting.
+* GreptimeDB uses [Apache Arrow™](https://arrow.apache.org/) as the memory model and [Apache Parquet™](https://parquet.apache.org/) as the persistent file format.
+* GreptimeDB's query engine is powered by [Apache Arrow DataFusion™](https://arrow.apache.org/datafusion/).
+* [Apache OpenDAL™](https://opendal.apache.org) gives GreptimeDB a very general and elegant data access abstraction layer.
+* GreptimeDB's meta service is based on [etcd](https://etcd.io/).
+* GreptimeDB uses [RustPython](https://github.com/RustPython/RustPython) for experimental embedded python scripting.
