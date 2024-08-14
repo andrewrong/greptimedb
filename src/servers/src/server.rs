@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_runtime::Runtime;
-use common_telemetry::logging::{error, info};
+use common_telemetry::{error, info};
 use futures::future::{try_join_all, AbortHandle, AbortRegistration, Abortable};
 use snafu::{ensure, ResultExt};
 use tokio::sync::{Mutex, RwLock};
@@ -125,7 +125,7 @@ impl AcceptTask {
                 if let Err(error) = join_handle.await {
                     // Couldn't use `error!(e; xxx)` because JoinError doesn't implement ErrorExt.
                     error!(
-                        "Unexpected error during shutdown {} server, error: {}",
+                        "Unexpected error during shutdown {} server, error: {:?}",
                         name, error
                     );
                 } else {
@@ -183,11 +183,11 @@ impl AcceptTask {
 pub(crate) struct BaseTcpServer {
     name: String,
     accept_task: Mutex<AcceptTask>,
-    io_runtime: Arc<Runtime>,
+    io_runtime: Runtime,
 }
 
 impl BaseTcpServer {
-    pub(crate) fn create_server(name: impl Into<String>, io_runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn create_server(name: impl Into<String>, io_runtime: Runtime) -> Self {
         let (abort_handle, registration) = AbortHandle::new_pair();
         Self {
             name: name.into(),
@@ -218,7 +218,7 @@ impl BaseTcpServer {
         task.start_with(join_handle, &self.name)
     }
 
-    pub(crate) fn io_runtime(&self) -> Arc<Runtime> {
+    pub(crate) fn io_runtime(&self) -> Runtime {
         self.io_runtime.clone()
     }
 }

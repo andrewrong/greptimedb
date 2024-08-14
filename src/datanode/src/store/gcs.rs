@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_telemetry::logging::info;
+use common_base::secrets::ExposeSecret;
+use common_telemetry::info;
 use object_store::services::Gcs;
 use object_store::{util, ObjectStore};
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 
 use crate::config::GcsConfig;
@@ -29,8 +29,7 @@ pub(crate) async fn new_gcs_object_store(gcs_config: &GcsConfig) -> Result<Objec
         gcs_config.bucket, &root
     );
 
-    let mut builder = Gcs::default();
-    builder
+    let builder = Gcs::default()
         .root(&root)
         .bucket(&gcs_config.bucket)
         .scope(&gcs_config.scope)

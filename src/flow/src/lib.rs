@@ -12,10 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! This crate manage dataflow in Greptime, including adapter, expr, plan, repr and utils.
+//! It can transform substrait plan into it's own plan and execute it.
+//! It also contains definition of expression, adapter and plan, and internal state management.
+
+#![feature(let_chains)]
+#![feature(duration_abs_diff)]
 #![allow(dead_code)]
 #![allow(unused_imports)]
+#![warn(clippy::missing_docs_in_private_items)]
+#![warn(clippy::too_many_lines)]
 // allow unused for now because it should be use later
 mod adapter;
+mod compute;
+pub mod error;
 mod expr;
+pub mod heartbeat;
 mod plan;
 mod repr;
+mod server;
+mod transform;
+mod utils;
+
+pub use adapter::{FlowWorkerManager, FlowWorkerManagerRef, FlownodeOptions};
+pub use error::{Error, Result};
+pub use server::{FlownodeBuilder, FlownodeInstance, FlownodeServer, FrontendInvoker};

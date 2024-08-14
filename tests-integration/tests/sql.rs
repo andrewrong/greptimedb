@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 use auth::user_provider_from_option;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use sqlx::mysql::{MySqlConnection, MySqlDatabaseError, MySqlPoolOptions};
@@ -21,7 +23,7 @@ use tests_integration::test_util::{
     setup_mysql_server, setup_mysql_server_with_user_provider, setup_pg_server,
     setup_pg_server_with_user_provider, StorageType,
 };
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 #[macro_export]
 macro_rules! sql_test {
@@ -34,8 +36,12 @@ macro_rules! sql_test {
                         #[$meta]
                     )*
                     async fn [< $test >]() {
+                        common_telemetry::init_default_ut_logging();
+
                         let store_type = tests_integration::test_util::StorageType::$service;
                         if store_type.test_on() {
+                            common_telemetry::info!("test {} starts, store_type: {:?}", stringify!($test), store_type);
+
                             let _ = $crate::sql::$test(store_type).await;
                         }
 
@@ -60,6 +66,8 @@ macro_rules! sql_tests {
                 test_postgres_auth,
                 test_postgres_crud,
                 test_postgres_timezone,
+                test_postgres_bytea,
+                test_postgres_datestyle,
                 test_postgres_parameter_inference,
                 test_mysql_prepare_stmt_insert_timestamp,
             );
@@ -136,14 +144,14 @@ pub async fn test_mysql_crud(store_type: StorageType) {
         .unwrap();
 
     sqlx::query(
-        "create table demo(i bigint, ts timestamp time index, d date, dt datetime, b blob)",
+        "create table demo(i bigint, ts timestamp time index default current_timestamp, d date default null, dt datetime default null, b blob default null)",
     )
     .execute(&pool)
     .await
     .unwrap();
     for i in 0..10 {
         let dt: DateTime<Utc> = DateTime::from_naive_utc_and_offset(
-            NaiveDateTime::from_timestamp_opt(60, i).unwrap(),
+            chrono::DateTime::from_timestamp(60, i).unwrap().naive_utc(),
             Utc,
         );
         let d = NaiveDate::from_yo_opt(2015, 100).unwrap();
@@ -175,7 +183,9 @@ pub async fn test_mysql_crud(store_type: StorageType) {
         let expected_d = NaiveDate::from_yo_opt(2015, 100).unwrap();
         assert_eq!(expected_d, d);
         let expected_dt: DateTime<Utc> = DateTime::from_naive_utc_and_offset(
-            NaiveDateTime::from_timestamp_opt(60, i as u32).unwrap(),
+            chrono::DateTime::from_timestamp(60, i as u32)
+                .unwrap()
+                .naive_utc(),
             Utc,
         );
         assert_eq!(
@@ -197,6 +207,22 @@ pub async fn test_mysql_crud(store_type: StorageType) {
         assert_eq!(ret, 6);
     }
 
+    // parameter type mismatch
+    let query_re = sqlx::query("select i from demo where i = ?")
+        .bind("test")
+        .fetch_all(&pool)
+        .await;
+    assert!(query_re.is_err());
+    let err = query_re.unwrap_err();
+    common_telemetry::info!("Error is {}", err);
+    assert_eq!(
+        err.into_database_error()
+            .unwrap()
+            .downcast::<MySqlDatabaseError>()
+            .number(),
+        1210,
+    );
+
     let _ = sqlx::query("delete from demo")
         .execute(&pool)
         .await
@@ -206,6 +232,31 @@ pub async fn test_mysql_crud(store_type: StorageType) {
         .await
         .unwrap();
     assert_eq!(rows.len(), 0);
+
+    // test prepare with default columns
+    sqlx::query("insert into demo(i) values(?)")
+        .bind(99)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("insert into demo(i) values(?)")
+        .bind(-99)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rows = sqlx::query("select * from demo")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+
+    for row in rows {
+        let i: i64 = row.get("i");
+        let ts: DateTime<Utc> = row.get("ts");
+        let now = common_time::util::current_time_millis();
+        assert!(now - ts.timestamp_millis() < 1000);
+        assert_eq!(i.abs(), 99);
+    }
 
     let _ = fe_mysql_server.shutdown().await;
     guard.remove_all().await;
@@ -339,7 +390,7 @@ pub async fn test_postgres_crud(store_type: StorageType) {
 
     for i in 0..10 {
         let d = NaiveDate::from_yo_opt(2015, 100).unwrap();
-        let dt = d.and_hms_opt(0, 0, 0).unwrap().timestamp_millis();
+        let dt = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
 
         sqlx::query("insert into demo values($1, $2, $3, $4)")
             .bind(i)
@@ -398,6 +449,301 @@ pub async fn test_postgres_crud(store_type: StorageType) {
     let _ = fe_pg_server.shutdown().await;
     guard.remove_all().await;
 }
+pub async fn test_postgres_bytea(store_type: StorageType) {
+    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_bytea_output").await;
+
+    let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+        tx.send(()).unwrap();
+    });
+    let _ = client
+        .simple_query("CREATE TABLE test(b BLOB, ts TIMESTAMP TIME INDEX)")
+        .await
+        .unwrap();
+    let _ = client
+        .simple_query("INSERT INTO test VALUES(X'6162636b6c6d2aa954', 0)")
+        .await
+        .unwrap();
+    let get_row = |mess: Vec<SimpleQueryMessage>| -> String {
+        match &mess[1] {
+            SimpleQueryMessage::Row(row) => row.get(0).unwrap().to_string(),
+            _ => unreachable!(),
+        }
+    };
+
+    let r = client.simple_query("SELECT b FROM test").await.unwrap();
+    let b = get_row(r);
+    assert_eq!(b, "\\x6162636b6c6d2aa954");
+
+    let _ = client.simple_query("SET bytea_output='hex'").await.unwrap();
+    let r = client.simple_query("SELECT b FROM test").await.unwrap();
+    let b = get_row(r);
+    assert_eq!(b, "\\x6162636b6c6d2aa954");
+
+    let _ = client
+        .simple_query("SET bytea_output='escape'")
+        .await
+        .unwrap();
+    let r = client.simple_query("SELECT b FROM test").await.unwrap();
+    let b = get_row(r);
+    assert_eq!(b, "abcklm*\\251T");
+
+    let _e = client
+        .simple_query("SET bytea_output='invalid'")
+        .await
+        .unwrap_err();
+
+    // binary format shall not be affected by bytea_output
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&format!("postgres://{addr}/public"))
+        .await
+        .unwrap();
+
+    let row = sqlx::query("select b from test")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let val: Vec<u8> = row.get("b");
+    assert_eq!(val, [97, 98, 99, 107, 108, 109, 42, 169, 84]);
+
+    drop(client);
+    rx.await.unwrap();
+
+    let _ = fe_pg_server.shutdown().await;
+    guard.remove_all().await;
+}
+
+pub async fn test_postgres_datestyle(store_type: StorageType) {
+    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "various datestyle").await;
+
+    let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+        tx.send(()).unwrap();
+    });
+
+    let validate_datestyle = |client: Client, datestyle: &str, is_valid: bool| {
+        let datestyle = datestyle.to_string();
+        async move {
+            assert_eq!(
+                client
+                    .simple_query(format!("SET DATESTYLE={}", datestyle).as_str())
+                    .await
+                    .is_ok(),
+                is_valid
+            );
+            client
+        }
+    };
+
+    // style followed by order is valid
+    let client = validate_datestyle(client, "'ISO,MDY'", true).await;
+
+    // Mix of string and ident is valid
+    let client = validate_datestyle(client, "'ISO',MDY", true).await;
+
+    // list of string that didn't corrupt is valid
+    let client = validate_datestyle(client, "'ISO,MDY','ISO,MDY'", true).await;
+
+    // corrupted style
+    let client = validate_datestyle(client, "'ISO,German'", false).await;
+
+    // corrupted order
+    let client = validate_datestyle(client, "'ISO,DMY','ISO,MDY'", false).await;
+
+    // as long as the value is not corrupted, it's valid
+    let client = validate_datestyle(client, "ISO,ISO,ISO,ISO,ISO,MDY,MDY,MDY,MDY", true).await;
+
+    let _ = client
+        .simple_query("CREATE TABLE ts_test(ts TIMESTAMP TIME INDEX)")
+        .await
+        .expect("CREATE TABLE ts_test ERROR");
+    let _ = client
+        .simple_query("CREATE TABLE date_test(d date, ts TIMESTAMP TIME INDEX)")
+        .await
+        .expect("CREATE TABLE date_test ERROR");
+
+    let _ = client
+        .simple_query("CREATE TABLE dt_test(dt datetime, ts TIMESTAMP TIME INDEX)")
+        .await
+        .expect("CREATE TABLE dt_test ERROR");
+
+    let _ = client
+        .simple_query("INSERT INTO ts_test VALUES('1997-12-17 07:37:16.123')")
+        .await
+        .expect("INSERT INTO ts_test ERROR");
+
+    let _ = client
+        .simple_query("INSERT INTO date_test VALUES('1997-12-17', '1997-12-17 07:37:16.123')")
+        .await
+        .expect("INSERT INTO date_test ERROR");
+
+    let _ = client
+        .simple_query(
+            "INSERT INTO dt_test VALUES('1997-12-17 07:37:16.123', '1997-12-17 07:37:16.123')",
+        )
+        .await
+        .expect("INSERT INTO dt_test ERROR");
+
+    let get_row = |mess: Vec<SimpleQueryMessage>| -> String {
+        match &mess[1] {
+            SimpleQueryMessage::Row(row) => row.get(0).unwrap().to_string(),
+            _ => unreachable!("Unexpected messages: {:?}", mess),
+        }
+    };
+
+    let date = "DATE";
+    let datetime = "TIMESTAMP";
+    let timestamp = "TIMESTAMP";
+
+    let iso = "ISO";
+    let sql = "SQL";
+    let postgres = "Postgres";
+    let german = "German";
+
+    let expected_set: HashMap<&str, HashMap<&str, HashMap<&str, &str>>> = HashMap::from([
+        (
+            date,
+            HashMap::from([
+                (
+                    iso,
+                    HashMap::from([
+                        ("MDY", "1997-12-17"),
+                        ("DMY", "1997-12-17"),
+                        ("YMD", "1997-12-17"),
+                    ]),
+                ),
+                (
+                    sql,
+                    HashMap::from([
+                        ("MDY", "12/17/1997"),
+                        ("DMY", "17/12/1997"),
+                        ("YMD", "12/17/1997"),
+                    ]),
+                ),
+                (
+                    postgres,
+                    HashMap::from([
+                        ("MDY", "12-17-1997"),
+                        ("DMY", "17-12-1997"),
+                        ("YMD", "12-17-1997"),
+                    ]),
+                ),
+                (
+                    german,
+                    HashMap::from([
+                        ("MDY", "17.12.1997"),
+                        ("DMY", "17.12.1997"),
+                        ("YMD", "17.12.1997"),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            timestamp,
+            HashMap::from([
+                (
+                    iso,
+                    HashMap::from([
+                        ("MDY", "1997-12-17 07:37:16.123000"),
+                        ("DMY", "1997-12-17 07:37:16.123000"),
+                        ("YMD", "1997-12-17 07:37:16.123000"),
+                    ]),
+                ),
+                (
+                    sql,
+                    HashMap::from([
+                        ("MDY", "12/17/1997 07:37:16.123000"),
+                        ("DMY", "17/12/1997 07:37:16.123000"),
+                        ("YMD", "12/17/1997 07:37:16.123000"),
+                    ]),
+                ),
+                (
+                    postgres,
+                    HashMap::from([
+                        ("MDY", "Wed Dec 17 07:37:16.123000 1997"),
+                        ("DMY", "Wed 17 Dec 07:37:16.123000 1997"),
+                        ("YMD", "Wed Dec 17 07:37:16.123000 1997"),
+                    ]),
+                ),
+                (
+                    german,
+                    HashMap::from([
+                        ("MDY", "17.12.1997 07:37:16.123000"),
+                        ("DMY", "17.12.1997 07:37:16.123000"),
+                        ("YMD", "17.12.1997 07:37:16.123000"),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+
+    let get_expected = |ty: &str, style: &str, order: &str| {
+        expected_set
+            .get(ty)
+            .and_then(|m| m.get(style))
+            .and_then(|m2| m2.get(order))
+            .unwrap()
+            .to_string()
+    };
+
+    for style in ["ISO", "SQL", "Postgres", "German"] {
+        for order in ["MDY", "DMY", "YMD"] {
+            let _ = client
+                .simple_query(&format!("SET DATESTYLE='{}', '{}'", style, order))
+                .await
+                .expect("SET DATESTYLE ERROR");
+
+            let r = client.simple_query("SELECT ts FROM ts_test").await.unwrap();
+            let ts = get_row(r);
+            assert_eq!(
+                ts,
+                get_expected(timestamp, style, order),
+                "style: {}, order: {}",
+                style,
+                order
+            );
+
+            let r = client
+                .simple_query("SELECT d FROM date_test")
+                .await
+                .unwrap();
+            let d = get_row(r);
+            assert_eq!(
+                d,
+                get_expected(date, style, order),
+                "style: {}, order: {}",
+                style,
+                order
+            );
+
+            let r = client.simple_query("SELECT dt FROM dt_test").await.unwrap();
+            let dt = get_row(r);
+            assert_eq!(
+                dt,
+                get_expected(datetime, style, order),
+                "style: {}, order: {}",
+                style,
+                order
+            );
+        }
+    }
+
+    drop(client);
+    rx.await.unwrap();
+
+    let _ = fe_pg_server.shutdown().await;
+    guard.remove_all().await;
+}
 
 pub async fn test_postgres_timezone(store_type: StorageType) {
     let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_inference").await;
@@ -406,12 +752,14 @@ pub async fn test_postgres_timezone(store_type: StorageType) {
         .await
         .unwrap();
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         connection.await.unwrap();
+        tx.send(()).unwrap();
     });
 
     let get_row = |mess: Vec<SimpleQueryMessage>| -> String {
-        match &mess[0] {
+        match &mess[1] {
             SimpleQueryMessage::Row(row) => row.get(0).unwrap().to_string(),
             _ => unreachable!(),
         }
@@ -450,6 +798,10 @@ pub async fn test_postgres_timezone(store_type: StorageType) {
             .unwrap(),
     );
     assert_eq!(timezone, "UTC");
+
+    drop(client);
+    rx.await.unwrap();
+
     let _ = fe_pg_server.shutdown().await;
     guard.remove_all().await;
 }
@@ -461,8 +813,10 @@ pub async fn test_postgres_parameter_inference(store_type: StorageType) {
         .await
         .unwrap();
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         connection.await.unwrap();
+        tx.send(()).unwrap();
     });
 
     // Create demo table
@@ -487,6 +841,10 @@ pub async fn test_postgres_parameter_inference(store_type: StorageType) {
         .unwrap();
 
     assert_eq!(1, rows.len());
+
+    // Shutdown the client.
+    drop(client);
+    rx.await.unwrap();
 
     let _ = fe_pg_server.shutdown().await;
     guard.remove_all().await;

@@ -17,9 +17,10 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType as ArrowDataType, Field};
+use arrow_array::{Array, ListArray};
 use common_base::bytes::{Bytes, StringBytes};
 use common_decimal::Decimal128;
-use common_telemetry::logging;
+use common_telemetry::error;
 use common_time::date::Date;
 use common_time::datetime::DateTime;
 use common_time::interval::IntervalUnit;
@@ -28,11 +29,10 @@ use common_time::timestamp::{TimeUnit, Timestamp};
 use common_time::{Duration, Interval, Timezone};
 use datafusion_common::ScalarValue;
 pub use ordered_float::OrderedFloat;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use snafu::{ensure, ResultExt};
 
-use crate::error;
-use crate::error::{Error, Result, TryFromValueSnafu};
+use crate::error::{self, ConvertArrowArrayToScalarsSnafu, Error, Result, TryFromValueSnafu};
 use crate::prelude::*;
 use crate::type_id::LogicalTypeId;
 use crate::types::{IntervalType, ListType};
@@ -110,9 +110,8 @@ impl Display for Value {
             Value::Interval(v) => write!(f, "{}", v.to_iso8601_string()),
             Value::Duration(d) => write!(f, "{d}"),
             Value::List(v) => {
-                let default = Box::<Vec<Value>>::default();
-                let items = v.items().as_ref().unwrap_or(&default);
-                let items = items
+                let items = v
+                    .items()
                     .iter()
                     .map(|i| i.to_string())
                     .collect::<Vec<String>>()
@@ -343,7 +342,7 @@ impl Value {
             Value::Float32(v) => ScalarValue::Float32(Some(v.0)),
             Value::Float64(v) => ScalarValue::Float64(Some(v.0)),
             Value::String(v) => ScalarValue::Utf8(Some(v.as_utf8().to_string())),
-            Value::Binary(v) => ScalarValue::LargeBinary(Some(v.to_vec())),
+            Value::Binary(v) => ScalarValue::Binary(Some(v.to_vec())),
             Value::Date(v) => ScalarValue::Date32(Some(v.val())),
             Value::DateTime(v) => ScalarValue::Date64(Some(v.val())),
             Value::Null => to_null_scalar_value(output_type)?,
@@ -367,6 +366,56 @@ impl Value {
         };
 
         Ok(scalar_value)
+    }
+
+    /// Apply `-` unary op if possible
+    pub fn try_negative(&self) -> Option<Self> {
+        match self {
+            Value::Null => Some(Value::Null),
+            Value::UInt8(x) => {
+                if *x == 0 {
+                    Some(Value::UInt8(*x))
+                } else {
+                    None
+                }
+            }
+            Value::UInt16(x) => {
+                if *x == 0 {
+                    Some(Value::UInt16(*x))
+                } else {
+                    None
+                }
+            }
+            Value::UInt32(x) => {
+                if *x == 0 {
+                    Some(Value::UInt32(*x))
+                } else {
+                    None
+                }
+            }
+            Value::UInt64(x) => {
+                if *x == 0 {
+                    Some(Value::UInt64(*x))
+                } else {
+                    None
+                }
+            }
+            Value::Int8(x) => Some(Value::Int8(-*x)),
+            Value::Int16(x) => Some(Value::Int16(-*x)),
+            Value::Int32(x) => Some(Value::Int32(-*x)),
+            Value::Int64(x) => Some(Value::Int64(-*x)),
+            Value::Float32(x) => Some(Value::Float32(-*x)),
+            Value::Float64(x) => Some(Value::Float64(-*x)),
+            Value::Decimal128(x) => Some(Value::Decimal128(x.negative())),
+            Value::Date(x) => Some(Value::Date(x.negative())),
+            Value::DateTime(x) => Some(Value::DateTime(x.negative())),
+            Value::Timestamp(x) => Some(Value::Timestamp(x.negative())),
+            Value::Time(x) => Some(Value::Time(x.negative())),
+            Value::Duration(x) => Some(Value::Duration(x.negative())),
+            Value::Interval(x) => Some(Value::Interval(x.negative())),
+
+            Value::Binary(_) | Value::String(_) | Value::Boolean(_) | Value::List(_) => None,
+        }
     }
 }
 
@@ -414,7 +463,7 @@ pub fn to_null_scalar_value(output_type: &ConcreteDataType) -> Result<ScalarValu
         ConcreteDataType::UInt64(_) => ScalarValue::UInt64(None),
         ConcreteDataType::Float32(_) => ScalarValue::Float32(None),
         ConcreteDataType::Float64(_) => ScalarValue::Float64(None),
-        ConcreteDataType::Binary(_) => ScalarValue::LargeBinary(None),
+        ConcreteDataType::Binary(_) => ScalarValue::Binary(None),
         ConcreteDataType::String(_) => ScalarValue::Utf8(None),
         ConcreteDataType::Date(_) => ScalarValue::Date32(None),
         ConcreteDataType::DateTime(_) => ScalarValue::Date64(None),
@@ -424,9 +473,10 @@ pub fn to_null_scalar_value(output_type: &ConcreteDataType) -> Result<ScalarValu
             IntervalType::DayTime(_) => ScalarValue::IntervalDayTime(None),
             IntervalType::MonthDayNano(_) => ScalarValue::IntervalMonthDayNano(None),
         },
-        ConcreteDataType::List(_) => {
-            ScalarValue::List(None, Arc::new(new_item_field(output_type.as_arrow_type())))
-        }
+        ConcreteDataType::List(_) => ScalarValue::List(Arc::new(ListArray::new_null(
+            Arc::new(new_item_field(output_type.as_arrow_type())),
+            0,
+        ))),
         ConcreteDataType::Dictionary(dict) => ScalarValue::Dictionary(
             Box::new(dict.key_type().as_arrow_type()),
             Box::new(to_null_scalar_value(dict.value_type())?),
@@ -487,7 +537,7 @@ pub fn scalar_value_to_timestamp(
         ScalarValue::Utf8(Some(s)) => match Timestamp::from_str(s, timezone) {
             Ok(t) => Some(t),
             Err(e) => {
-                logging::error!(e;"Failed to convert string literal {s} to timestamp");
+                error!(e;"Failed to convert string literal {s} to timestamp");
                 None
             }
         },
@@ -695,7 +745,7 @@ impl TryFrom<Value> for serde_json::Value {
             Value::Int64(v) => serde_json::Value::from(v),
             Value::Float32(v) => serde_json::Value::from(v.0),
             Value::Float64(v) => serde_json::Value::from(v.0),
-            Value::String(bytes) => serde_json::Value::String(bytes.as_utf8().to_string()),
+            Value::String(bytes) => serde_json::Value::String(bytes.into_string()),
             Value::Binary(bytes) => serde_json::to_value(bytes)?,
             Value::Date(v) => serde_json::Value::Number(v.val().into()),
             Value::DateTime(v) => serde_json::Value::Number(v.val().into()),
@@ -715,9 +765,7 @@ impl TryFrom<Value> for serde_json::Value {
 /// List value.
 #[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ListValue {
-    /// List of nested Values (boxed to reduce size_of(Value))
-    #[allow(clippy::box_collection)]
-    items: Option<Box<Vec<Value>>>,
+    items: Vec<Value>,
     /// Inner values datatype, to distinguish empty lists of different datatypes.
     /// Restricted by DataFusion, cannot use null datatype for empty list.
     datatype: ConcreteDataType,
@@ -726,11 +774,11 @@ pub struct ListValue {
 impl Eq for ListValue {}
 
 impl ListValue {
-    pub fn new(items: Option<Box<Vec<Value>>>, datatype: ConcreteDataType) -> Self {
+    pub fn new(items: Vec<Value>, datatype: ConcreteDataType) -> Self {
         Self { items, datatype }
     }
 
-    pub fn items(&self) -> &Option<Box<Vec<Value>>> {
+    pub fn items(&self) -> &[Value] {
         &self.items
     }
 
@@ -739,38 +787,30 @@ impl ListValue {
     }
 
     fn try_to_scalar_value(&self, output_type: &ListType) -> Result<ScalarValue> {
-        let vs = if let Some(items) = self.items() {
-            Some(
-                items
-                    .iter()
-                    .map(|v| v.try_to_scalar_value(output_type.item_type()))
-                    .collect::<Result<Vec<_>>>()?,
-            )
-        } else {
-            None
-        };
-
-        Ok(ScalarValue::List(
-            vs,
-            Arc::new(new_item_field(output_type.item_type().as_arrow_type())),
-        ))
+        let vs = self
+            .items
+            .iter()
+            .map(|v| v.try_to_scalar_value(output_type.item_type()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ScalarValue::List(ScalarValue::new_list(
+            &vs,
+            &self.datatype.as_arrow_type(),
+        )))
     }
 
     /// use 'the first item size' * 'length of items' to estimate the size.
     /// it could be inaccurate.
     fn estimated_size(&self) -> usize {
-        if let Some(items) = &self.items {
-            if let Some(item) = items.first() {
-                return item.as_value_ref().data_size() * items.len();
-            }
-        }
-        0
+        self.items
+            .first()
+            .map(|x| x.as_value_ref().data_size() * self.items.len())
+            .unwrap_or(0)
     }
 }
 
 impl Default for ListValue {
     fn default() -> ListValue {
-        ListValue::new(None, ConcreteDataType::null_datatype())
+        ListValue::new(vec![], ConcreteDataType::null_datatype())
     }
 }
 
@@ -824,17 +864,14 @@ impl TryFrom<ScalarValue> for Value {
             ScalarValue::Binary(b)
             | ScalarValue::LargeBinary(b)
             | ScalarValue::FixedSizeBinary(_, b) => Value::from(b.map(Bytes::from)),
-            ScalarValue::List(vs, field) | ScalarValue::Fixedsizelist(vs, field, _) => {
-                let items = if let Some(vs) = vs {
-                    let vs = vs
-                        .into_iter()
-                        .map(ScalarValue::try_into)
-                        .collect::<Result<_>>()?;
-                    Some(Box::new(vs))
-                } else {
-                    None
-                };
-                let datatype = ConcreteDataType::try_from(field.data_type())?;
+            ScalarValue::List(array) => {
+                let datatype = ConcreteDataType::try_from(array.data_type())?;
+                let items = ScalarValue::convert_array_to_scalar_vec(array.as_ref())
+                    .context(ConvertArrowArrayToScalarsSnafu)?
+                    .into_iter()
+                    .flatten()
+                    .map(|x| x.try_into())
+                    .collect::<Result<Vec<Value>>>()?;
                 Value::List(ListValue::new(items, datatype))
             }
             ScalarValue::Date32(d) => d.map(|x| Value::Date(Date::new(x))).unwrap_or(Value::Null),
@@ -891,8 +928,12 @@ impl TryFrom<ScalarValue> for Value {
                 .map(|v| Value::Decimal128(Decimal128::new(v, p, s)))
                 .unwrap_or(Value::Null),
             ScalarValue::Decimal256(_, _, _)
-            | ScalarValue::Struct(_, _)
-            | ScalarValue::Dictionary(_, _) => {
+            | ScalarValue::Struct(_)
+            | ScalarValue::FixedSizeList(_)
+            | ScalarValue::LargeList(_)
+            | ScalarValue::Dictionary(_, _)
+            | ScalarValue::Union(_, _, _)
+            | ScalarValue::Float16(_) => {
                 return error::UnsupportedArrowTypeSnafu {
                     arrow_type: v.data_type(),
                 }
@@ -1174,6 +1215,39 @@ impl<'a> From<Option<ListValueRef<'a>>> for ValueRef<'a> {
     }
 }
 
+impl<'a> TryFrom<ValueRef<'a>> for serde_json::Value {
+    type Error = serde_json::Error;
+
+    fn try_from(value: ValueRef<'a>) -> serde_json::Result<serde_json::Value> {
+        let json_value = match value {
+            ValueRef::Null => serde_json::Value::Null,
+            ValueRef::Boolean(v) => serde_json::Value::Bool(v),
+            ValueRef::UInt8(v) => serde_json::Value::from(v),
+            ValueRef::UInt16(v) => serde_json::Value::from(v),
+            ValueRef::UInt32(v) => serde_json::Value::from(v),
+            ValueRef::UInt64(v) => serde_json::Value::from(v),
+            ValueRef::Int8(v) => serde_json::Value::from(v),
+            ValueRef::Int16(v) => serde_json::Value::from(v),
+            ValueRef::Int32(v) => serde_json::Value::from(v),
+            ValueRef::Int64(v) => serde_json::Value::from(v),
+            ValueRef::Float32(v) => serde_json::Value::from(v.0),
+            ValueRef::Float64(v) => serde_json::Value::from(v.0),
+            ValueRef::String(bytes) => serde_json::Value::String(bytes.to_string()),
+            ValueRef::Binary(bytes) => serde_json::to_value(bytes)?,
+            ValueRef::Date(v) => serde_json::Value::Number(v.val().into()),
+            ValueRef::DateTime(v) => serde_json::Value::Number(v.val().into()),
+            ValueRef::List(v) => serde_json::to_value(v)?,
+            ValueRef::Timestamp(v) => serde_json::to_value(v.value())?,
+            ValueRef::Time(v) => serde_json::to_value(v.value())?,
+            ValueRef::Interval(v) => serde_json::to_value(v.to_i128())?,
+            ValueRef::Duration(v) => serde_json::to_value(v.value())?,
+            ValueRef::Decimal128(v) => serde_json::to_value(v.to_string())?,
+        };
+
+        Ok(json_value)
+    }
+}
+
 /// Reference to a [ListValue].
 ///
 /// Now comparison still requires some allocation (call of `to_value()`) and
@@ -1204,6 +1278,18 @@ impl<'a> ListValueRef<'a> {
     }
 }
 
+impl<'a> Serialize for ListValueRef<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            ListValueRef::Indexed { vector, idx } => match vector.get(*idx) {
+                Value::List(v) => v.serialize(serializer),
+                _ => unreachable!(),
+            },
+            ListValueRef::Ref { val } => val.serialize(serializer),
+        }
+    }
+}
+
 impl<'a> PartialEq for ListValueRef<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.to_value().eq(&other.to_value())
@@ -1230,7 +1316,9 @@ impl<'a> ValueRef<'a> {
     /// The size is estimated and only considers the data size.
     pub fn data_size(&self) -> usize {
         match *self {
-            ValueRef::Null => 0,
+            // Since the `Null` type is also considered to occupy space, we have opted to use the
+            // size of `i64` as an initial approximation.
+            ValueRef::Null => 8,
             ValueRef::Boolean(_) => 1,
             ValueRef::UInt8(_) => 1,
             ValueRef::UInt16(_) => 2,
@@ -1380,19 +1468,22 @@ mod tests {
 
         assert_eq!(
             Value::List(ListValue::new(
-                Some(Box::new(vec![Value::Int32(1), Value::Null])),
-                ConcreteDataType::int32_datatype()
+                vec![Value::Int32(1), Value::Null],
+                ConcreteDataType::list_datatype(ConcreteDataType::int32_datatype())
             )),
-            ScalarValue::new_list(
-                Some(vec![ScalarValue::Int32(Some(1)), ScalarValue::Int32(None)]),
-                ArrowDataType::Int32,
-            )
+            ScalarValue::List(ScalarValue::new_list(
+                &[ScalarValue::Int32(Some(1)), ScalarValue::Int32(None)],
+                &ArrowDataType::Int32,
+            ))
             .try_into()
             .unwrap()
         );
         assert_eq!(
-            Value::List(ListValue::new(None, ConcreteDataType::uint32_datatype())),
-            ScalarValue::new_list(None, ArrowDataType::UInt32)
+            Value::List(ListValue::new(
+                vec![],
+                ConcreteDataType::list_datatype(ConcreteDataType::uint32_datatype())
+            )),
+            ScalarValue::List(ScalarValue::new_list(&[], &ArrowDataType::UInt32))
                 .try_into()
                 .unwrap()
         );
@@ -1662,7 +1753,7 @@ mod tests {
         check_type_and_value(
             &ConcreteDataType::list_datatype(ConcreteDataType::int32_datatype()),
             &Value::List(ListValue::new(
-                Some(Box::new(vec![Value::Int32(10)])),
+                vec![Value::Int32(10)],
                 ConcreteDataType::int32_datatype(),
             )),
         );
@@ -1827,7 +1918,7 @@ mod tests {
         assert_eq!(
             json_value,
             to_json(Value::List(ListValue {
-                items: Some(Box::new(vec![Value::Int32(123)])),
+                items: vec![Value::Int32(123)],
                 datatype: ConcreteDataType::int32_datatype(),
             }))
         );
@@ -1895,7 +1986,7 @@ mod tests {
         check_as_value_ref!(DateTime, DateTime::new(1034));
 
         let list = ListValue {
-            items: None,
+            items: vec![],
             datatype: ConcreteDataType::int32_datatype(),
         };
         assert_eq!(
@@ -1933,7 +2024,7 @@ mod tests {
         check_as_correct!(Time::new_second(12), Time, as_time);
         check_as_correct!(Duration::new_second(12), Duration, as_duration);
         let list = ListValue {
-            items: None,
+            items: vec![],
             datatype: ConcreteDataType::int32_datatype(),
         };
         check_as_correct!(ListValueRef::Ref { val: &list }, List, as_list);
@@ -1989,7 +2080,7 @@ mod tests {
         );
         assert_eq!(
             Value::List(ListValue::new(
-                Some(Box::new(vec![Value::Int8(1), Value::Int8(2)])),
+                vec![Value::Int8(1), Value::Int8(2)],
                 ConcreteDataType::int8_datatype(),
             ))
             .to_string(),
@@ -1997,7 +2088,7 @@ mod tests {
         );
         assert_eq!(
             Value::List(ListValue::new(
-                Some(Box::default()),
+                vec![],
                 ConcreteDataType::timestamp_second_datatype(),
             ))
             .to_string(),
@@ -2005,7 +2096,7 @@ mod tests {
         );
         assert_eq!(
             Value::List(ListValue::new(
-                Some(Box::default()),
+                vec![],
                 ConcreteDataType::timestamp_millisecond_datatype(),
             ))
             .to_string(),
@@ -2013,7 +2104,7 @@ mod tests {
         );
         assert_eq!(
             Value::List(ListValue::new(
-                Some(Box::default()),
+                vec![],
                 ConcreteDataType::timestamp_microsecond_datatype(),
             ))
             .to_string(),
@@ -2021,7 +2112,7 @@ mod tests {
         );
         assert_eq!(
             Value::List(ListValue::new(
-                Some(Box::default()),
+                vec![],
                 ConcreteDataType::timestamp_nanosecond_datatype(),
             ))
             .to_string(),
@@ -2110,7 +2201,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            ScalarValue::LargeBinary(Some("world".as_bytes().to_vec())),
+            ScalarValue::Binary(Some("world".as_bytes().to_vec())),
             Value::Binary(Bytes::from("world".as_bytes()))
                 .try_to_scalar_value(&ConcreteDataType::binary_datatype())
                 .unwrap()
@@ -2192,7 +2283,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            ScalarValue::LargeBinary(None),
+            ScalarValue::Binary(None),
             Value::Null
                 .try_to_scalar_value(&ConcreteDataType::binary_datatype())
                 .unwrap()
@@ -2251,19 +2342,29 @@ mod tests {
 
     #[test]
     fn test_list_value_to_scalar_value() {
-        let items = Some(Box::new(vec![Value::Int32(-1), Value::Null]));
+        let items = vec![Value::Int32(-1), Value::Null];
         let list = Value::List(ListValue::new(items, ConcreteDataType::int32_datatype()));
         let df_list = list
             .try_to_scalar_value(&ConcreteDataType::list_datatype(
                 ConcreteDataType::int32_datatype(),
             ))
             .unwrap();
-        assert!(matches!(df_list, ScalarValue::List(_, _)));
+        assert!(matches!(df_list, ScalarValue::List(_)));
         match df_list {
-            ScalarValue::List(vs, field) => {
-                assert_eq!(ArrowDataType::Int32, *field.data_type());
+            ScalarValue::List(vs) => {
+                assert_eq!(
+                    ArrowDataType::List(Arc::new(Field::new_list_field(
+                        ArrowDataType::Int32,
+                        true
+                    ))),
+                    *vs.data_type()
+                );
 
-                let vs = vs.unwrap();
+                let vs = ScalarValue::convert_array_to_scalar_vec(vs.as_ref())
+                    .unwrap()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
                 assert_eq!(
                     vs,
                     vec![ScalarValue::Int32(Some(-1)), ScalarValue::Int32(None)]
@@ -2339,6 +2440,7 @@ mod tests {
 
     #[test]
     fn test_value_ref_estimated_size() {
+        check_value_ref_size_eq(&ValueRef::Null, 8);
         check_value_ref_size_eq(&ValueRef::Boolean(true), 1);
         check_value_ref_size_eq(&ValueRef::UInt8(1), 1);
         check_value_ref_size_eq(&ValueRef::UInt16(1), 2);
@@ -2364,10 +2466,10 @@ mod tests {
         check_value_ref_size_eq(
             &ValueRef::List(ListValueRef::Ref {
                 val: &ListValue {
-                    items: Some(Box::new(vec![
+                    items: vec![
                         Value::String("hello world".into()),
                         Value::String("greptimedb".into()),
-                    ])),
+                    ],
                     datatype: ConcreteDataType::string_datatype(),
                 },
             }),
@@ -2384,7 +2486,6 @@ mod tests {
         for vec_opt in &data {
             if let Some(vec) = vec_opt {
                 let values = vec.iter().map(|v| Value::from(*v)).collect();
-                let values = Some(Box::new(values));
                 let list_value = ListValue::new(values, ConcreteDataType::int32_datatype());
 
                 builder.push(Some(ListValueRef::Ref { val: &list_value }));

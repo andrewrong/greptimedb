@@ -28,13 +28,14 @@ pub mod sql;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use api::prom_store::remote::{ReadRequest, WriteRequest};
+use api::prom_store::remote::ReadRequest;
 use api::v1::RowInsertRequests;
 use async_trait::async_trait;
 use common_query::Output;
 use headers::HeaderValue;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use pipeline::{GreptimeTransformer, Pipeline, PipelineInfo, PipelineVersion};
 use serde_json::Value;
 use session::context::QueryContextRef;
 
@@ -48,6 +49,7 @@ pub type InfluxdbLineProtocolHandlerRef = Arc<dyn InfluxdbLineProtocolHandler + 
 pub type PromStoreProtocolHandlerRef = Arc<dyn PromStoreProtocolHandler + Send + Sync>;
 pub type OpenTelemetryProtocolHandlerRef = Arc<dyn OpenTelemetryProtocolHandler + Send + Sync>;
 pub type ScriptHandlerRef = Arc<dyn ScriptHandler + Send + Sync>;
+pub type LogHandlerRef = Arc<dyn LogHandler + Send + Sync>;
 
 #[async_trait]
 pub trait ScriptHandler {
@@ -91,14 +93,6 @@ pub trait PromStoreProtocolHandler {
     /// Handling prometheus remote write requests
     async fn write(
         &self,
-        request: WriteRequest,
-        ctx: QueryContextRef,
-        with_metric_engine: bool,
-    ) -> Result<Output>;
-
-    /// Handling prometheus remote write requests
-    async fn write_fast(
-        &self,
         request: RowInsertRequests,
         ctx: QueryContextRef,
         with_metric_engine: bool,
@@ -125,4 +119,35 @@ pub trait OpenTelemetryProtocolHandler {
         request: ExportTraceServiceRequest,
         ctx: QueryContextRef,
     ) -> Result<Output>;
+}
+
+/// LogHandler is responsible for handling log related requests.
+/// It should be able to insert logs and manage pipelines.
+/// The pipeline is a series of transformations that can be applied to logs.
+/// The pipeline is stored in the database and can be retrieved by name.
+#[async_trait]
+pub trait LogHandler {
+    async fn insert_logs(&self, log: RowInsertRequests, ctx: QueryContextRef) -> Result<Output>;
+
+    async fn get_pipeline(
+        &self,
+        name: &str,
+        version: PipelineVersion,
+        query_ctx: QueryContextRef,
+    ) -> Result<Arc<Pipeline<GreptimeTransformer>>>;
+
+    async fn insert_pipeline(
+        &self,
+        name: &str,
+        content_type: &str,
+        pipeline: &str,
+        query_ctx: QueryContextRef,
+    ) -> Result<PipelineInfo>;
+
+    async fn delete_pipeline(
+        &self,
+        name: &str,
+        version: PipelineVersion,
+        query_ctx: QueryContextRef,
+    ) -> Result<Option<()>>;
 }

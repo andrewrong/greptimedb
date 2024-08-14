@@ -16,11 +16,12 @@
 #![feature(try_blocks)]
 #![feature(exclusive_wrapper)]
 #![feature(let_chains)]
+#![feature(if_let_guard)]
 
 use datatypes::schema::Schema;
 use query::plan::LogicalPlan;
-use serde::{Deserialize, Serialize};
 
+pub mod addrs;
 pub mod configurator;
 pub mod error;
 pub mod export_metrics;
@@ -29,7 +30,6 @@ pub mod heartbeat_options;
 pub mod http;
 pub mod influxdb;
 pub mod interceptor;
-pub mod line_writer;
 mod metrics;
 pub mod metrics_handler;
 pub mod mysql;
@@ -41,19 +41,12 @@ pub mod prom_store;
 pub mod prometheus_handler;
 pub mod proto;
 pub mod query_handler;
-#[allow(clippy::all)]
-mod repeated_field;
+pub mod repeated_field;
 mod row_writer;
 pub mod server;
-mod shutdown;
 pub mod tls;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Standalone,
-    Distributed,
-}
+pub use common_config::Mode;
 
 /// Cached SQL and logical plan for database interfaces
 #[derive(Clone)]

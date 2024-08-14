@@ -32,6 +32,8 @@ pub const TIME_INDEX_KEY: &str = "greptime:time_index";
 pub const COMMENT_KEY: &str = "greptime:storage:comment";
 /// Key used to store default constraint in arrow field's metadata.
 const DEFAULT_CONSTRAINT_KEY: &str = "greptime:default_constraint";
+/// Key used to store fulltext options in arrow field's metadata.
+pub const FULLTEXT_KEY: &str = "greptime:fulltext";
 
 /// Schema of a column, used as an immutable struct.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +55,10 @@ impl fmt::Debug for ColumnSchema {
             self.data_type,
             if self.is_nullable { "null" } else { "not null" },
         )?;
+
+        if self.is_time_index {
+            write!(f, " time_index")?;
+        }
 
         // Add default constraint if present
         if let Some(default_constraint) = &self.default_constraint {
@@ -143,9 +149,28 @@ impl ColumnSchema {
     }
 
     /// Set the nullablity to `true` of the column.
+    /// Similar to [set_nullable] but take the ownership and return a owned value.
+    ///
+    /// [set_nullable]: Self::set_nullable
     pub fn with_nullable_set(mut self) -> Self {
         self.is_nullable = true;
         self
+    }
+
+    /// Set the nullability to `true` of the column.
+    /// Similar to [with_nullable_set] but don't take the ownership
+    ///
+    /// [with_nullable_set]: Self::with_nullable_set
+    pub fn set_nullable(&mut self) {
+        self.is_nullable = true;
+    }
+
+    /// Set the `is_time_index` to `true` of the column.
+    /// Similar to [with_time_index] but don't take the ownership.
+    ///
+    /// [with_time_index]: Self::with_time_index
+    pub fn set_time_index(&mut self) {
+        self.is_time_index = true;
     }
 
     /// Creates a new [`ColumnSchema`] with given metadata.
@@ -217,6 +242,26 @@ impl ColumnSchema {
             }
         }
     }
+
+    /// Retrieves the fulltext options for the column.
+    pub fn fulltext_options(&self) -> Result<Option<FulltextOptions>> {
+        match self.metadata.get(FULLTEXT_KEY) {
+            None => Ok(None),
+            Some(json) => {
+                let options =
+                    serde_json::from_str(json).context(error::DeserializeSnafu { json })?;
+                Ok(Some(options))
+            }
+        }
+    }
+
+    pub fn with_fulltext_options(mut self, options: FulltextOptions) -> Result<Self> {
+        self.metadata.insert(
+            FULLTEXT_KEY.to_string(),
+            serde_json::to_string(&options).context(error::SerializeSnafu)?,
+        );
+        Ok(self)
+    }
 }
 
 impl TryFrom<&Field> for ColumnSchema {
@@ -270,6 +315,37 @@ impl TryFrom<&ColumnSchema> for Field {
             column_schema.is_nullable(),
         )
         .with_metadata(metadata))
+    }
+}
+
+/// Fulltext options for a column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct FulltextOptions {
+    /// Whether the fulltext index is enabled.
+    pub enable: bool,
+    /// The fulltext analyzer to use.
+    #[serde(default)]
+    pub analyzer: FulltextAnalyzer,
+    /// Whether the fulltext index is case-sensitive.
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+/// Fulltext analyzer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FulltextAnalyzer {
+    #[default]
+    English,
+    Chinese,
+}
+
+impl fmt::Display for FulltextAnalyzer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FulltextAnalyzer::English => write!(f, "English"),
+            FulltextAnalyzer::Chinese => write!(f, "Chinese"),
+        }
     }
 }
 

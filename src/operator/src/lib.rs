@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(assert_matches)]
+#![feature(if_let_guard)]
+
 pub mod delete;
 pub mod error;
 pub mod expr_factory;
+pub mod flow;
 pub mod insert;
 pub mod metrics;
 pub mod procedure;

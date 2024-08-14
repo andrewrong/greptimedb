@@ -63,6 +63,17 @@ impl FileId {
     pub fn as_puffin(&self) -> String {
         format!("{}{}", self, ".puffin")
     }
+
+    /// Converts [FileId] as byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl From<FileId> for Uuid {
+    fn from(value: FileId) -> Self {
+        value.0
+    }
 }
 
 impl fmt::Display for FileId {
@@ -82,6 +93,15 @@ impl FromStr for FileId {
 /// Time range of a SST file.
 pub type FileTimeRange = (Timestamp, Timestamp);
 
+/// Checks if two inclusive timestamp ranges overlap with each other.
+pub(crate) fn overlaps(l: &FileTimeRange, r: &FileTimeRange) -> bool {
+    let (l, r) = if l.0 <= r.0 { (l, r) } else { (r, l) };
+    let (_, l_end) = l;
+    let (r_start, _) = r;
+
+    r_start <= l_end
+}
+
 /// Metadata of a SST file.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -100,6 +120,18 @@ pub struct FileMeta {
     pub available_indexes: SmallVec<[IndexType; 4]>,
     /// Size of the index file.
     pub index_file_size: u64,
+    /// Number of rows in the file.
+    ///
+    /// For historical reasons, this field might be missing in old files. Thus
+    /// the default value `0` doesn't means the file doesn't contains any rows,
+    /// but instead means the number of rows is unknown.
+    pub num_rows: u64,
+    /// Number of row groups in the file.
+    ///
+    /// For historical reasons, this field might be missing in old files. Thus
+    /// the default value `0` doesn't means the file doesn't contains any rows,
+    /// but instead means the number of rows is unknown.
+    pub num_row_groups: u64,
 }
 
 /// Type of index.
@@ -107,11 +139,16 @@ pub struct FileMeta {
 pub enum IndexType {
     /// Inverted index.
     InvertedIndex,
+    /// Full-text index.
+    FulltextIndex,
 }
 
 impl FileMeta {
     pub fn inverted_index_available(&self) -> bool {
         self.available_indexes.contains(&IndexType::InvertedIndex)
+    }
+    pub fn fulltext_index_available(&self) -> bool {
+        self.available_indexes.contains(&IndexType::FulltextIndex)
     }
 }
 
@@ -175,8 +212,13 @@ impl FileHandle {
         self.inner.compacting.store(compacting, Ordering::Relaxed);
     }
 
-    pub fn meta(&self) -> FileMeta {
-        self.inner.meta.clone()
+    /// Returns a reference to the [FileMeta].
+    pub fn meta_ref(&self) -> &FileMeta {
+        &self.inner.meta
+    }
+
+    pub fn size(&self) -> u64 {
+        self.inner.meta.file_size
     }
 }
 
@@ -255,6 +297,8 @@ mod tests {
             file_size: 0,
             available_indexes: SmallVec::from_iter([IndexType::InvertedIndex]),
             index_file_size: 0,
+            num_rows: 0,
+            num_row_groups: 0,
         }
     }
 

@@ -33,20 +33,21 @@ use table::test_util::MemTable;
 use table::TableRef;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::codec::CompressionEncoding;
 
 use crate::{create_testing_grpc_query_handler, LOCALHOST_WITH_0};
 
 struct MockGrpcServer {
     query_handler: ServerGrpcQueryHandlerRef,
     user_provider: Option<UserProviderRef>,
-    runtime: Arc<Runtime>,
+    runtime: Runtime,
 }
 
 impl MockGrpcServer {
     fn new(
         query_handler: ServerGrpcQueryHandlerRef,
         user_provider: Option<UserProviderRef>,
-        runtime: Arc<Runtime>,
+        runtime: Runtime,
     ) -> Self {
         Self {
             query_handler,
@@ -59,10 +60,14 @@ impl MockGrpcServer {
         let service: FlightCraftWrapper<_> = GreptimeRequestHandler::new(
             self.query_handler.clone(),
             self.user_provider.clone(),
-            self.runtime.clone(),
+            Some(self.runtime.clone()),
         )
         .into();
         FlightServiceServer::new(service)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Zstd)
     }
 }
 
@@ -102,13 +107,11 @@ impl Server for MockGrpcServer {
 
 fn create_grpc_server(table: TableRef) -> Result<Arc<dyn Server>> {
     let query_handler = create_testing_grpc_query_handler(table);
-    let io_runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(4)
-            .thread_name("grpc-io-handlers")
-            .build()
-            .unwrap(),
-    );
+    let io_runtime = RuntimeBuilder::default()
+        .worker_threads(4)
+        .thread_name("grpc-io-handlers")
+        .build()
+        .unwrap();
 
     let provider = MockUserProvider::default();
 

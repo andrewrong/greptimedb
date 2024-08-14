@@ -15,13 +15,18 @@
 //! Common structs and utilities for reading data.
 
 pub mod compat;
+pub mod dedup;
+pub mod last_row;
 pub mod merge;
 pub mod projection;
+pub(crate) mod prune;
 pub(crate) mod scan_region;
 pub(crate) mod seq_scan;
+pub(crate) mod unordered_scan;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::v1::OpType;
 use async_trait::async_trait;
@@ -49,6 +54,8 @@ use crate::error::{
     ComputeArrowSnafu, ComputeVectorSnafu, ConvertVectorSnafu, InvalidBatchSnafu, Result,
 };
 use crate::memtable::BoxedBatchIterator;
+use crate::metrics::{READ_BATCHES_RETURN, READ_ROWS_RETURN, READ_STAGE_ELAPSED};
+use crate::read::prune::PruneReader;
 
 /// Storage internal representation of a batch of rows for a primary key (time series).
 ///
@@ -70,8 +77,6 @@ pub struct Batch {
     ///
     /// UInt8 type, not null.
     op_types: Arc<UInt8Vector>,
-    /// True if op types only contains put operations.
-    put_only: bool,
     /// Fields organized in columnar format.
     fields: Vec<BatchColumn>,
 }
@@ -191,6 +196,9 @@ impl Batch {
     }
 
     /// Replaces the primary key of the batch.
+    ///
+    /// Notice that this [Batch] also contains a maybe-exist `pk_values`.
+    /// Be sure to update that field as well.
     pub fn set_primary_key(&mut self, primary_key: Vec<u8>) {
         self.primary_key = primary_key;
     }
@@ -218,7 +226,6 @@ impl Batch {
             sequences: Arc::new(self.sequences.get_slice(offset, length)),
             op_types: Arc::new(self.op_types.get_slice(offset, length)),
             fields,
-            put_only: self.put_only,
         }
     }
 
@@ -285,11 +292,6 @@ impl Batch {
 
     /// Removes rows whose op type is delete.
     pub fn filter_deleted(&mut self) -> Result<()> {
-        if self.put_only {
-            // If there is only put operation, we can skip comparison and filtering.
-            return Ok(());
-        }
-
         // Safety: op type column is not null.
         let array = self.op_types.as_arrow();
         // Find rows with non-delete op type.
@@ -320,10 +322,6 @@ impl Batch {
             )
             .unwrap(),
         );
-        // Also updates put_only field if it contains other ops.
-        if !self.put_only {
-            self.put_only = is_put_only(&self.op_types);
-        }
         for batch_column in &mut self.fields {
             batch_column.data = batch_column
                 .data
@@ -334,12 +332,13 @@ impl Batch {
         Ok(())
     }
 
-    /// Sorts and dedup rows in the batch.
+    /// Sorts rows in the batch. If `dedup` is true, it also removes
+    /// duplicated rows according to primary keys.
     ///
     /// It orders rows by timestamp, sequence desc and only keep the latest
     /// row for the same timestamp. It doesn't consider op type as sequence
     /// should already provide uniqueness for a row.
-    pub fn sort_and_dedup(&mut self) -> Result<()> {
+    pub fn sort(&mut self, dedup: bool) -> Result<()> {
         // If building a converter each time is costly, we may allow passing a
         // converter.
         let converter = RowConverter::new(vec![
@@ -362,30 +361,45 @@ impl Batch {
         let mut to_sort: Vec<_> = rows.iter().enumerate().collect();
         to_sort.sort_unstable_by(|left, right| left.1.cmp(&right.1));
 
-        // Dedup by timestamps.
-        to_sort.dedup_by(|left, right| {
-            debug_assert_eq!(18, left.1.as_ref().len());
-            debug_assert_eq!(18, right.1.as_ref().len());
-            let (left_key, right_key) = (left.1.as_ref(), right.1.as_ref());
-            // We only compare the timestamp part and ignore sequence.
-            left_key[..TIMESTAMP_KEY_LEN] == right_key[..TIMESTAMP_KEY_LEN]
-        });
+        if dedup {
+            // Dedup by timestamps.
+            to_sort.dedup_by(|left, right| {
+                debug_assert_eq!(18, left.1.as_ref().len());
+                debug_assert_eq!(18, right.1.as_ref().len());
+                let (left_key, right_key) = (left.1.as_ref(), right.1.as_ref());
+                // We only compare the timestamp part and ignore sequence.
+                left_key[..TIMESTAMP_KEY_LEN] == right_key[..TIMESTAMP_KEY_LEN]
+            });
+        }
 
         let indices = UInt32Vector::from_iter_values(to_sort.iter().map(|v| v.0 as u32));
         self.take_in_place(&indices)
     }
 
-    /// Returns ids of fields in the [Batch] after applying the `projection`.
+    /// Returns the estimated memory size of the batch.
+    pub fn memory_size(&self) -> usize {
+        let mut size = std::mem::size_of::<Self>();
+        size += self.primary_key.len();
+        size += self.timestamps.memory_size();
+        size += self.sequences.memory_size();
+        size += self.op_types.memory_size();
+        for batch_column in &self.fields {
+            size += batch_column.data.memory_size();
+        }
+        size
+    }
+
+    /// Returns ids and datatypes of fields in the [Batch] after applying the `projection`.
     pub(crate) fn projected_fields(
         metadata: &RegionMetadata,
         projection: &[ColumnId],
-    ) -> Vec<ColumnId> {
+    ) -> Vec<(ColumnId, ConcreteDataType)> {
         let projected_ids: HashSet<_> = projection.iter().copied().collect();
         metadata
             .field_columns()
             .filter_map(|column| {
                 if projected_ids.contains(&column.column_id) {
-                    Some(column.column_id)
+                    Some((column.column_id, column.column_schema.data_type.clone()))
                 } else {
                     None
                 }
@@ -444,10 +458,6 @@ impl Batch {
         let array = arrow::compute::take(self.op_types.as_arrow(), indices.as_arrow(), None)
             .context(ComputeArrowSnafu)?;
         self.op_types = Arc::new(UInt8Vector::try_from_arrow_array(array).unwrap());
-        // Also updates put_only field if it contains other ops.
-        if !self.put_only {
-            self.put_only = is_put_only(&self.op_types);
-        }
         for batch_column in &mut self.fields {
             batch_column.data = batch_column
                 .data
@@ -479,16 +489,6 @@ impl Batch {
         // Safety: sequences is not null so it actually returns Some.
         self.sequences.get_data(index).unwrap()
     }
-}
-
-/// Returns whether the op types vector only contains put operation.
-fn is_put_only(op_types: &UInt8Vector) -> bool {
-    // Safety: Op types is not null.
-    op_types
-        .as_arrow()
-        .values()
-        .iter()
-        .all(|v| *v == OpType::Put as u8)
 }
 
 /// Len of timestamp in arrow row format.
@@ -666,10 +666,6 @@ impl BatchBuilder {
             );
         }
 
-        // Checks whether op types are put only. In the future, we may get this from statistics
-        // in memtables and SSTs.
-        let put_only = is_put_only(&op_types);
-
         Ok(Batch {
             primary_key: self.primary_key,
             pk_values: None,
@@ -677,7 +673,6 @@ impl BatchBuilder {
             sequences,
             op_types,
             fields: self.fields,
-            put_only,
         })
     }
 }
@@ -692,6 +687,8 @@ pub enum Source {
     Iter(BoxedBatchIterator),
     /// Source from a [BoxedBatchStream].
     Stream(BoxedBatchStream),
+    /// Source from a [PruneReader].
+    PruneReader(PruneReader),
 }
 
 impl Source {
@@ -701,6 +698,7 @@ impl Source {
             Source::Reader(reader) => reader.next_batch().await,
             Source::Iter(iter) => iter.next().transpose(),
             Source::Stream(stream) => stream.try_next().await,
+            Source::PruneReader(reader) => reader.next_batch().await,
         }
     }
 }
@@ -730,6 +728,65 @@ pub type BoxedBatchStream = BoxStream<'static, Result<Batch>>;
 impl<T: BatchReader + ?Sized> BatchReader for Box<T> {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
         (**self).next_batch().await
+    }
+}
+
+/// Metrics for scanners.
+#[derive(Debug, Default)]
+pub(crate) struct ScannerMetrics {
+    /// Duration to prepare the scan task.
+    prepare_scan_cost: Duration,
+    /// Duration to build parts.
+    build_parts_cost: Duration,
+    /// Duration to build the (merge) reader.
+    build_reader_cost: Duration,
+    /// Duration to scan data.
+    scan_cost: Duration,
+    /// Duration to convert batches.
+    convert_cost: Duration,
+    /// Duration while waiting for `yield`.
+    yield_cost: Duration,
+    /// Duration of the scan.
+    total_cost: Duration,
+    /// Number of batches returned.
+    num_batches: usize,
+    /// Number of rows returned.
+    num_rows: usize,
+}
+
+impl ScannerMetrics {
+    /// Sets and observes metrics on initializing parts.
+    fn observe_init_part(&mut self, build_parts_cost: Duration) {
+        self.build_parts_cost = build_parts_cost;
+
+        // Observes metrics.
+        READ_STAGE_ELAPSED
+            .with_label_values(&["prepare_scan"])
+            .observe(self.prepare_scan_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["build_parts"])
+            .observe(self.build_parts_cost.as_secs_f64());
+    }
+
+    /// Observes metrics on scanner finish.
+    fn observe_metrics_on_finish(&self) {
+        READ_STAGE_ELAPSED
+            .with_label_values(&["build_reader"])
+            .observe(self.build_reader_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["convert_rb"])
+            .observe(self.convert_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["scan"])
+            .observe(self.scan_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["yield"])
+            .observe(self.yield_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["total"])
+            .observe(self.total_cost.as_secs_f64());
+        READ_ROWS_RETURN.observe(self.num_rows as f64);
+        READ_BATCHES_RETURN.observe(self.num_batches as f64);
     }
 }
 
@@ -932,7 +989,6 @@ mod tests {
             &[OpType::Delete, OpType::Put, OpType::Delete, OpType::Put],
             &[21, 22, 23, 24],
         );
-        assert!(!batch.put_only);
         batch.filter_deleted().unwrap();
         let expect = new_batch(&[2, 4], &[12, 14], &[OpType::Put, OpType::Put], &[22, 24]);
         assert_eq!(expect, batch);
@@ -943,7 +999,6 @@ mod tests {
             &[OpType::Put, OpType::Put, OpType::Put, OpType::Put],
             &[21, 22, 23, 24],
         );
-        assert!(batch.put_only);
         let expect = batch.clone();
         batch.filter_deleted().unwrap();
         assert_eq!(expect, batch);
@@ -983,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_sort_and_dedup() {
-        let mut batch = new_batch(
+        let original = new_batch(
             &[2, 3, 1, 4, 5, 2],
             &[1, 2, 3, 4, 5, 6],
             &[
@@ -996,30 +1051,67 @@ mod tests {
             ],
             &[21, 22, 23, 24, 25, 26],
         );
-        batch.sort_and_dedup().unwrap();
-        // It should only keep one timestamp 2.
-        let expect = new_batch(
-            &[1, 2, 3, 4, 5],
-            &[3, 6, 2, 4, 5],
-            &[
-                OpType::Put,
-                OpType::Put,
-                OpType::Put,
-                OpType::Put,
-                OpType::Put,
-            ],
-            &[23, 26, 22, 24, 25],
-        );
-        assert_eq!(expect, batch);
 
-        let mut batch = new_batch(
+        let mut batch = original.clone();
+        batch.sort(true).unwrap();
+        // It should only keep one timestamp 2.
+        assert_eq!(
+            new_batch(
+                &[1, 2, 3, 4, 5],
+                &[3, 6, 2, 4, 5],
+                &[
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                ],
+                &[23, 26, 22, 24, 25],
+            ),
+            batch
+        );
+
+        let mut batch = original.clone();
+        batch.sort(false).unwrap();
+
+        // It should only keep one timestamp 2.
+        assert_eq!(
+            new_batch(
+                &[1, 2, 2, 3, 4, 5],
+                &[3, 6, 1, 2, 4, 5],
+                &[
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                    OpType::Put,
+                ],
+                &[23, 26, 21, 22, 24, 25],
+            ),
+            batch
+        );
+
+        let original = new_batch(
             &[2, 2, 1],
             &[1, 6, 1],
             &[OpType::Delete, OpType::Put, OpType::Put],
             &[21, 22, 23],
         );
-        batch.sort_and_dedup().unwrap();
+
+        let mut batch = original.clone();
+        batch.sort(true).unwrap();
         let expect = new_batch(&[1, 2], &[1, 6], &[OpType::Put, OpType::Put], &[23, 22]);
+        assert_eq!(expect, batch);
+
+        let mut batch = original.clone();
+        batch.sort(false).unwrap();
+        let expect = new_batch(
+            &[1, 2, 2],
+            &[1, 6, 1],
+            &[OpType::Put, OpType::Put, OpType::Delete],
+            &[23, 22, 21],
+        );
         assert_eq!(expect, batch);
     }
 }

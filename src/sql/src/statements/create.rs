@@ -15,12 +15,16 @@
 use std::fmt::{Display, Formatter};
 
 use common_catalog::consts::FILE_ENGINE;
+use datatypes::schema::{FulltextAnalyzer, FulltextOptions};
 use itertools::Itertools;
-use sqlparser::ast::Expr;
+use sqlparser::ast::{ColumnOptionDef, DataType, Expr, Query};
 use sqlparser_derive::{Visit, VisitMut};
 
-use crate::ast::{ColumnDef, Ident, ObjectName, SqlOption, TableConstraint, Value as SqlValue};
+use crate::ast::{ColumnDef, Ident, ObjectName, TableConstraint, Value as SqlValue};
+use crate::error::{FulltextInvalidOptionSnafu, Result};
+use crate::statements::statement::Statement;
 use crate::statements::OptionMap;
+use crate::{COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE};
 
 const LINE_SEP: &str = ",\n";
 const COMMA_SEP: &str = ", ";
@@ -47,6 +51,23 @@ macro_rules! format_list_comma {
     };
 }
 
+fn format_table_constraint(constraints: &[TableConstraint]) -> String {
+    constraints
+        .iter()
+        .map(|c| {
+            if is_time_index(c) {
+                let TableConstraint::Unique { columns, .. } = c else {
+                    unreachable!()
+                };
+
+                format_indent!("{}TIME INDEX ({})", format_list_comma!(columns))
+            } else {
+                format_indent!(c)
+            }
+        })
+        .join(LINE_SEP)
+}
+
 /// Time index name, used in table constraints.
 pub const TIME_INDEX: &str = "__time_index";
 
@@ -54,7 +75,6 @@ pub const TIME_INDEX: &str = "__time_index";
 pub fn is_time_index(constraint: &TableConstraint) -> bool {
     matches!(constraint, TableConstraint::Unique {
         name: Some(name),
-        is_primary: false,
         ..
     }  if name.value == TIME_INDEX)
 }
@@ -66,63 +86,103 @@ pub struct CreateTable {
     pub table_id: u32,
     /// Table name
     pub name: ObjectName,
-    pub columns: Vec<ColumnDef>,
+    pub columns: Vec<Column>,
     pub engine: String,
     pub constraints: Vec<TableConstraint>,
-    /// Table options in `WITH`.
-    pub options: Vec<SqlOption>,
+    /// Table options in `WITH`. All keys are lowercase.
+    pub options: OptionMap,
     pub partitions: Option<Partitions>,
 }
 
-impl CreateTable {
-    fn format_constraints(&self) -> String {
-        self.constraints
-            .iter()
-            .map(|c| {
-                if is_time_index(c) {
-                    let TableConstraint::Unique { columns, .. } = c else {
-                        unreachable!()
-                    };
+/// Column definition in `CREATE TABLE` statement.
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
+pub struct Column {
+    /// `ColumnDef` from `sqlparser::ast`
+    pub column_def: ColumnDef,
+    /// Column extensions for greptimedb dialect.
+    pub extensions: ColumnExtensions,
+}
 
-                    format_indent!("{}TIME INDEX ({})", format_list_comma!(columns))
-                } else {
-                    format_indent!(c)
+/// Column extensions for greptimedb dialect.
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut, Default)]
+pub struct ColumnExtensions {
+    /// Fulltext options.
+    pub fulltext_options: Option<OptionMap>,
+}
+
+impl Column {
+    pub fn name(&self) -> &Ident {
+        &self.column_def.name
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        &self.column_def.data_type
+    }
+
+    pub fn mut_data_type(&mut self) -> &mut DataType {
+        &mut self.column_def.data_type
+    }
+
+    pub fn options(&self) -> &[ColumnOptionDef] {
+        &self.column_def.options
+    }
+
+    pub fn mut_options(&mut self) -> &mut Vec<ColumnOptionDef> {
+        &mut self.column_def.options
+    }
+}
+
+impl Display for Column {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.column_def)?;
+        if let Some(fulltext_options) = &self.extensions.fulltext_options {
+            if !fulltext_options.is_empty() {
+                let options = fulltext_options.kv_pairs();
+                write!(f, " FULLTEXT WITH({})", format_list_comma!(options))?;
+            } else {
+                write!(f, " FULLTEXT")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ColumnExtensions {
+    pub fn build_fulltext_options(&self) -> Result<Option<FulltextOptions>> {
+        let Some(options) = self.fulltext_options.as_ref() else {
+            return Ok(None);
+        };
+
+        let mut fulltext = FulltextOptions {
+            enable: true,
+            ..Default::default()
+        };
+        if let Some(analyzer) = options.get(COLUMN_FULLTEXT_OPT_KEY_ANALYZER) {
+            match analyzer.to_ascii_lowercase().as_str() {
+                "english" => fulltext.analyzer = FulltextAnalyzer::English,
+                "chinese" => fulltext.analyzer = FulltextAnalyzer::Chinese,
+                _ => {
+                    return FulltextInvalidOptionSnafu {
+                        msg: format!("{analyzer}, expected: 'English' | 'Chinese'"),
+                    }
+                    .fail();
                 }
-            })
-            .join(LINE_SEP)
-    }
-
-    #[inline]
-    fn format_partitions(&self) -> String {
-        if let Some(partitions) = &self.partitions {
-            format!("{}\n", partitions)
-        } else {
-            String::default()
+            }
         }
-    }
-
-    #[inline]
-    fn format_if_not_exists(&self) -> &str {
-        if self.if_not_exists {
-            "IF NOT EXISTS"
-        } else {
-            ""
+        if let Some(case_sensitive) = options.get(COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE) {
+            match case_sensitive.to_ascii_lowercase().as_str() {
+                "true" => fulltext.case_sensitive = true,
+                "false" => fulltext.case_sensitive = false,
+                _ => {
+                    return FulltextInvalidOptionSnafu {
+                        msg: format!("{case_sensitive}, expected: 'true' | 'false'"),
+                    }
+                    .fail();
+                }
+            }
         }
-    }
 
-    #[inline]
-    fn format_options(&self) -> String {
-        if self.options.is_empty() {
-            String::default()
-        } else {
-            let options: Vec<&SqlOption> = self.options.iter().sorted().collect();
-            let options = format_list_indent!(options);
-            format!(
-                r#"WITH(
-{options}
-)"#
-            )
-        }
+        Ok(Some(fulltext))
     }
 }
 
@@ -166,36 +226,35 @@ impl Display for Partitions {
                 "PARTITION ON COLUMNS ({}) (\n{}\n)",
                 format_list_comma!(self.column_list),
                 format_list_indent!(self.exprs),
-            )
-        } else {
-            write!(f, "")
+            )?;
         }
+        Ok(())
     }
 }
 
 impl Display for CreateTable {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let if_not_exists = self.format_if_not_exists();
-        let name = &self.name;
-        let columns = format_list_indent!(self.columns);
-        let constraints = self.format_constraints();
-        let partitions = self.format_partitions();
-        let engine = &self.engine;
-        let options = self.format_options();
-        let maybe_external = if self.engine == FILE_ENGINE {
-            "EXTERNAL "
-        } else {
-            ""
-        };
-        write!(
-            f,
-            r#"CREATE {maybe_external}TABLE {if_not_exists} {name} (
-{columns},
-{constraints}
-)
-{partitions}ENGINE={engine}
-{options}"#
-        )
+        write!(f, "CREATE ")?;
+        if self.engine == FILE_ENGINE {
+            write!(f, "EXTERNAL ")?;
+        }
+        write!(f, "TABLE ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        writeln!(f, "{} (", &self.name)?;
+        writeln!(f, "{},", format_list_indent!(self.columns))?;
+        writeln!(f, "{}", format_table_constraint(&self.constraints))?;
+        writeln!(f, ")")?;
+        if let Some(partitions) = &self.partitions {
+            writeln!(f, "{partitions}")?;
+        }
+        writeln!(f, "ENGINE={}", &self.engine)?;
+        if !self.options.is_empty() {
+            let options = self.options.kv_pairs();
+            write!(f, "WITH(\n{}\n)", format_list_indent!(options))?;
+        }
+        Ok(())
     }
 }
 
@@ -204,15 +263,32 @@ pub struct CreateDatabase {
     pub name: ObjectName,
     /// Create if not exists
     pub if_not_exists: bool,
+    pub options: OptionMap,
 }
 
 impl CreateDatabase {
     /// Creates a statement for `CREATE DATABASE`
-    pub fn new(name: ObjectName, if_not_exists: bool) -> Self {
+    pub fn new(name: ObjectName, if_not_exists: bool, options: OptionMap) -> Self {
         Self {
             name,
             if_not_exists,
+            options,
         }
+    }
+}
+
+impl Display for CreateDatabase {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CREATE DATABASE ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", &self.name)?;
+        if !self.options.is_empty() {
+            let options = self.options.kv_pairs();
+            write!(f, "\nWITH(\n{}\n)", format_list_indent!(options))?;
+        }
+        Ok(())
     }
 }
 
@@ -220,13 +296,31 @@ impl CreateDatabase {
 pub struct CreateExternalTable {
     /// Table name
     pub name: ObjectName,
-    pub columns: Vec<ColumnDef>,
+    pub columns: Vec<Column>,
     pub constraints: Vec<TableConstraint>,
-    /// Table options in `WITH`.
-    /// All keys are lowercase.
+    /// Table options in `WITH`. All keys are lowercase.
     pub options: OptionMap,
     pub if_not_exists: bool,
     pub engine: String,
+}
+
+impl Display for CreateExternalTable {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CREATE EXTERNAL TABLE ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        writeln!(f, "{} (", &self.name)?;
+        writeln!(f, "{},", format_list_indent!(self.columns))?;
+        writeln!(f, "{}", format_table_constraint(&self.constraints))?;
+        writeln!(f, ")")?;
+        writeln!(f, "ENGINE={}", &self.engine)?;
+        if !self.options.is_empty() {
+            let options = self.options.kv_pairs();
+            write!(f, "WITH(\n{}\n)", format_list_indent!(options))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
@@ -235,6 +329,89 @@ pub struct CreateTableLike {
     pub table_name: ObjectName,
     /// The table that is designated to be imitated by `Like`
     pub source_name: ObjectName,
+}
+
+impl Display for CreateTableLike {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let table_name = &self.table_name;
+        let source_name = &self.source_name;
+        write!(f, r#"CREATE TABLE {table_name} LIKE {source_name}"#)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
+pub struct CreateFlow {
+    /// Flow name
+    pub flow_name: ObjectName,
+    /// Output (sink) table name
+    pub sink_table_name: ObjectName,
+    /// Whether to replace existing task
+    pub or_replace: bool,
+    /// Create if not exist
+    pub if_not_exists: bool,
+    /// `EXPIRE AFTER`
+    /// Duration in second as `i64`
+    pub expire_after: Option<i64>,
+    /// Comment string
+    pub comment: Option<String>,
+    /// SQL statement
+    pub query: Box<Query>,
+}
+
+impl Display for CreateFlow {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CREATE ")?;
+        if self.or_replace {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "FLOW ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        writeln!(f, "{}", &self.flow_name)?;
+        writeln!(f, "SINK TO {}", &self.sink_table_name)?;
+        if let Some(expire_after) = &self.expire_after {
+            writeln!(f, "EXPIRE AFTER {} ", expire_after)?;
+        }
+        if let Some(comment) = &self.comment {
+            writeln!(f, "COMMENT '{}'", comment)?;
+        }
+        write!(f, "AS {}", &self.query)
+    }
+}
+
+/// Create SQL view statement.
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
+pub struct CreateView {
+    /// View name
+    pub name: ObjectName,
+    /// An optional list of names to be used for columns of the view
+    pub columns: Vec<Ident>,
+    /// The clause after `As` that defines the VIEW.
+    /// Can only be either [Statement::Query] or [Statement::Tql].
+    pub query: Box<Statement>,
+    /// Whether to replace existing VIEW
+    pub or_replace: bool,
+    /// Create VIEW only when it doesn't exists
+    pub if_not_exists: bool,
+}
+
+impl Display for CreateView {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CREATE ")?;
+        if self.or_replace {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "VIEW ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        write!(f, "{} ", &self.name)?;
+        if !self.columns.is_empty() {
+            write!(f, "({}) ", format_list_comma!(self.columns))?;
+        }
+        write!(f, "AS {}", &self.query)
+    }
 }
 
 #[cfg(test)]
@@ -261,7 +438,7 @@ mod tests {
                             host > 'a',
                        )
                        engine=mito
-                       with(regions=1, ttl='7d', storage='File');
+                       with(ttl='7d', storage='File');
          ";
         let result =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
@@ -287,7 +464,6 @@ PARTITION ON COLUMNS (host) (
 )
 ENGINE=mito
 WITH(
-  regions = 1,
   storage = 'File',
   ttl = '7d'
 )"#,
@@ -364,14 +540,14 @@ ENGINE=mito
       )
       PARTITION ON COLUMNS (host) ()
       engine=mito
-      with(regions=1, ttl='7d', 'compaction.type'='world');
+      with(ttl='7d', 'compaction.type'='world');
 ";
         let result =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
                 .unwrap();
         match &result[0] {
             Statement::CreateTable(c) => {
-                assert_eq!(3, c.options.len());
+                assert_eq!(2, c.options.len());
             }
             _ => unreachable!(),
         }
@@ -386,10 +562,179 @@ ENGINE=mito
       )
       PARTITION ON COLUMNS (host) ()
       engine=mito
-      with(regions=1, ttl='7d', hello='world');
+      with(ttl='7d', hello='world');
 ";
         let result =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert_matches!(result, Err(Error::InvalidTableOption { .. }))
+    }
+
+    #[test]
+    fn test_display_create_database() {
+        let sql = r"create database test;";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::CreateDatabase { .. });
+
+        match &stmts[0] {
+            Statement::CreateDatabase(set) => {
+                let new_sql = format!("\n{}", set);
+                assert_eq!(
+                    r#"
+CREATE DATABASE test"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+
+        let sql = r"create database if not exists test;";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::CreateDatabase { .. });
+
+        match &stmts[0] {
+            Statement::CreateDatabase(set) => {
+                let new_sql = format!("\n{}", set);
+                assert_eq!(
+                    r#"
+CREATE DATABASE IF NOT EXISTS test"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+
+        let sql = r#"CREATE DATABASE IF NOT EXISTS test WITH (ttl='1h');"#;
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::CreateDatabase { .. });
+
+        match &stmts[0] {
+            Statement::CreateDatabase(set) => {
+                let new_sql = format!("\n{}", set);
+                assert_eq!(
+                    r#"
+CREATE DATABASE IF NOT EXISTS test
+WITH(
+  ttl = '1h'
+)"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+    }
+
+    #[test]
+    fn test_display_create_table_like() {
+        let sql = r"create table t2 like t1;";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::CreateTableLike { .. });
+
+        match &stmts[0] {
+            Statement::CreateTableLike(create) => {
+                let new_sql = format!("\n{}", create);
+                assert_eq!(
+                    r#"
+CREATE TABLE t2 LIKE t1"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+    }
+
+    #[test]
+    fn test_display_create_external_table() {
+        let sql = r#"CREATE EXTERNAL TABLE city (
+            host string,
+            ts timestamp,
+            cpu float64 default 0,
+            memory float64,
+            TIME INDEX (ts),
+            PRIMARY KEY(host)
+) WITH (location='/var/data/city.csv', format='csv');"#;
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::CreateExternalTable { .. });
+
+        match &stmts[0] {
+            Statement::CreateExternalTable(create) => {
+                let new_sql = format!("\n{}", create);
+                assert_eq!(
+                    r#"
+CREATE EXTERNAL TABLE city (
+  host STRING,
+  ts TIMESTAMP,
+  cpu FLOAT64 DEFAULT 0,
+  memory FLOAT64,
+  TIME INDEX (ts),
+  PRIMARY KEY (host)
+)
+ENGINE=file
+WITH(
+  format = 'csv',
+  location = '/var/data/city.csv'
+)"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+    }
+
+    #[test]
+    fn test_display_create_flow() {
+        let sql = r"CREATE FLOW filter_numbers
+            SINK TO out_num_cnt
+            AS SELECT number FROM numbers_input where number > 10;";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, result.len());
+
+        match &result[0] {
+            Statement::CreateFlow(c) => {
+                let new_sql = format!("\n{}", c);
+                assert_eq!(
+                    r#"
+CREATE FLOW filter_numbers
+SINK TO out_num_cnt
+AS SELECT number FROM numbers_input WHERE number > 10"#,
+                    &new_sql
+                );
+
+                let new_result = ParserContext::create_with_dialect(
+                    &new_sql,
+                    &GreptimeDbDialect {},
+                    ParseOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(result, new_result);
+            }
+            _ => unreachable!(),
+        }
     }
 }

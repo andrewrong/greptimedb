@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_telemetry::logging::info;
+use common_base::secrets::ExposeSecret;
+use common_telemetry::info;
 use object_store::services::Azblob;
 use object_store::{util, ObjectStore};
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 
 use crate::config::AzblobConfig;
@@ -30,8 +30,7 @@ pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Res
         azblob_config.container, &root
     );
 
-    let mut builder = Azblob::default();
-    let _ = builder
+    let mut builder = Azblob::default()
         .root(&root)
         .container(&azblob_config.container)
         .endpoint(&azblob_config.endpoint)
@@ -40,8 +39,8 @@ pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Res
         .http_client(build_http_client()?);
 
     if let Some(token) = &azblob_config.sas_token {
-        let _ = builder.sas_token(token);
-    }
+        builder = builder.sas_token(token);
+    };
 
     Ok(ObjectStore::new(builder)
         .context(error::InitBackendSnafu)?

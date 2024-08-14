@@ -14,15 +14,16 @@
 
 use std::collections::HashMap;
 
+use axum::headers::HeaderValue;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use common_query::Output;
-use reqwest::header::HeaderValue;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::header::GREPTIME_DB_HEADER_METRICS;
+use super::process_with_limit;
 use crate::http::header::{GREPTIME_DB_HEADER_EXECUTION_TIME, GREPTIME_DB_HEADER_FORMAT};
 use crate::http::{handler, GreptimeQueryOutput, HttpResponse, ResponseFormat};
 
@@ -40,7 +41,7 @@ pub struct GreptimedbV1Response {
 
 impl GreptimedbV1Response {
     pub async fn from_output(outputs: Vec<crate::error::Result<Output>>) -> HttpResponse {
-        match handler::from_output(ResponseFormat::GreptimedbV1, outputs).await {
+        match handler::from_output(outputs).await {
             Ok((output, resp_metrics)) => HttpResponse::GreptimedbV1(Self {
                 output,
                 execution_time_ms: 0,
@@ -62,6 +63,11 @@ impl GreptimedbV1Response {
     pub fn execution_time_ms(&self) -> u64 {
         self.execution_time_ms
     }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.output = process_with_limit(self.output, limit);
+        self
+    }
 }
 
 impl IntoResponse for GreptimedbV1Response {
@@ -77,7 +83,7 @@ impl IntoResponse for GreptimedbV1Response {
 
         resp.headers_mut().insert(
             &GREPTIME_DB_HEADER_FORMAT,
-            HeaderValue::from_static("greptimedb_v1"),
+            HeaderValue::from_static(ResponseFormat::GreptimedbV1.as_str()),
         );
         resp.headers_mut().insert(
             &GREPTIME_DB_HEADER_EXECUTION_TIME,

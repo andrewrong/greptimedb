@@ -15,18 +15,21 @@
 //! A write-through cache for remote object stores.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common_base::readable_size::ReadableSize;
 use common_telemetry::{debug, info};
+use futures::AsyncWriteExt;
 use object_store::manager::ObjectStoreManagerRef;
 use object_store::ObjectStore;
 use snafu::ResultExt;
 
-use crate::access_layer::{new_fs_object_store, SstWriteRequest};
+use crate::access_layer::{new_fs_cache_store, SstWriteRequest};
 use crate::cache::file_cache::{FileCache, FileCacheRef, FileType, IndexKey, IndexValue};
 use crate::error::{self, Result};
 use crate::metrics::{FLUSH_ELAPSED, UPLOAD_BYTES_TOTAL};
 use crate::sst::index::intermediate::IntermediateManager;
+use crate::sst::index::puffin_manager::PuffinManagerFactory;
 use crate::sst::index::IndexerBuilder;
 use crate::sst::parquet::writer::ParquetWriter;
 use crate::sst::parquet::{SstInfo, WriteOptions};
@@ -42,7 +45,9 @@ pub struct WriteCache {
     #[allow(unused)]
     /// TODO: Remove unused after implementing async write cache
     object_store_manager: ObjectStoreManagerRef,
-    /// Intermediate manager for inverted index.
+    /// Puffin manager factory for index.
+    puffin_manager_factory: PuffinManagerFactory,
+    /// Intermediate manager for index.
     intermediate_manager: IntermediateManager,
 }
 
@@ -55,14 +60,17 @@ impl WriteCache {
         local_store: ObjectStore,
         object_store_manager: ObjectStoreManagerRef,
         cache_capacity: ReadableSize,
+        ttl: Option<Duration>,
+        puffin_manager_factory: PuffinManagerFactory,
         intermediate_manager: IntermediateManager,
     ) -> Result<Self> {
-        let file_cache = FileCache::new(local_store, cache_capacity);
+        let file_cache = FileCache::new(local_store, cache_capacity, ttl);
         file_cache.recover().await?;
 
         Ok(Self {
             file_cache: Arc::new(file_cache),
             object_store_manager,
+            puffin_manager_factory,
             intermediate_manager,
         })
     }
@@ -72,15 +80,19 @@ impl WriteCache {
         cache_dir: &str,
         object_store_manager: ObjectStoreManagerRef,
         cache_capacity: ReadableSize,
+        ttl: Option<Duration>,
+        puffin_manager_factory: PuffinManagerFactory,
         intermediate_manager: IntermediateManager,
     ) -> Result<Self> {
         info!("Init write cache on {cache_dir}, capacity: {cache_capacity}");
 
-        let local_store = new_fs_object_store(cache_dir).await?;
+        let local_store = new_fs_cache_store(cache_dir).await?;
         Self::new(
             local_store,
             object_store_manager,
             cache_capacity,
+            ttl,
+            puffin_manager_factory,
             intermediate_manager,
         )
         .await
@@ -107,25 +119,27 @@ impl WriteCache {
         let parquet_key = IndexKey::new(region_id, file_id, FileType::Parquet);
         let puffin_key = IndexKey::new(region_id, file_id, FileType::Puffin);
 
+        let store = self.file_cache.local_store();
         let indexer = IndexerBuilder {
-            create_inverted_index: write_request.create_inverted_index,
-            mem_threshold_index_create: write_request.mem_threshold_index_create,
-            write_buffer_size: write_request.index_write_buffer_size,
+            op_type: write_request.op_type,
             file_id,
             file_path: self.file_cache.cache_file_path(puffin_key),
             metadata: &write_request.metadata,
             row_group_size: write_opts.row_group_size,
-            object_store: self.file_cache.local_store(),
+            puffin_manager: self.puffin_manager_factory.build(store),
             intermediate_manager: self.intermediate_manager.clone(),
             index_options: write_request.index_options,
+            inverted_index_config: write_request.inverted_index_config,
+            fulltext_index_config: write_request.fulltext_index_config,
         }
-        .build();
+        .build()
+        .await;
 
         // Write to FileCache.
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            self.file_cache.local_store(),
             self.file_cache.cache_file_path(parquet_key),
             write_request.metadata,
-            self.file_cache.local_store(),
             indexer,
         );
 
@@ -143,7 +157,7 @@ impl WriteCache {
         let remote_store = &upload_request.remote_store;
         self.upload(parquet_key, parquet_path, remote_store).await?;
 
-        if sst_info.inverted_index_available {
+        if sst_info.index_metadata.file_size > 0 {
             let puffin_key = IndexKey::new(region_id, file_id, FileType::Puffin);
             let puffin_path = &upload_request.index_upload_path;
             self.upload(puffin_key, puffin_path, remote_store).await?;
@@ -171,19 +185,29 @@ impl WriteCache {
             }])
             .start_timer();
 
+        let cached_value = self
+            .file_cache
+            .local_store()
+            .stat(&cache_path)
+            .await
+            .context(error::OpenDalSnafu)?;
         let reader = self
             .file_cache
             .local_store()
             .reader(&cache_path)
             .await
+            .context(error::OpenDalSnafu)?
+            .into_futures_async_read(0..cached_value.content_length())
+            .await
             .context(error::OpenDalSnafu)?;
 
         let mut writer = remote_store
             .writer_with(upload_path)
-            .buffer(DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize)
+            .chunk(DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize)
             .concurrent(DEFAULT_WRITE_CONCURRENCY)
             .await
-            .context(error::OpenDalSnafu)?;
+            .context(error::OpenDalSnafu)?
+            .into_futures_async_write();
 
         let bytes_written =
             futures::io::copy(reader, &mut writer)
@@ -195,7 +219,11 @@ impl WriteCache {
                 })?;
 
         // Must close to upload all data.
-        writer.close().await.context(error::OpenDalSnafu)?;
+        writer.close().await.context(error::UploadSnafu {
+            region_id,
+            file_id,
+            file_type,
+        })?;
 
         UPLOAD_BYTES_TOTAL.inc_by(bytes_written);
 
@@ -229,10 +257,10 @@ pub struct SstUploadRequest {
 
 #[cfg(test)]
 mod tests {
-
     use common_test_util::temp_dir::create_temp_dir;
 
     use super::*;
+    use crate::access_layer::OperationType;
     use crate::cache::test_util::new_fs_store;
     use crate::cache::CacheManager;
     use crate::region::options::IndexOptions;
@@ -272,15 +300,15 @@ mod tests {
         ]);
 
         let write_request = SstWriteRequest {
+            op_type: OperationType::Flush,
             file_id,
             metadata,
             source,
             storage: None,
-            create_inverted_index: true,
-            mem_threshold_index_create: None,
-            index_write_buffer_size: None,
             cache_manager: Default::default(),
             index_options: IndexOptions::default(),
+            inverted_index_config: Default::default(),
+            fulltext_index_config: Default::default(),
         };
 
         let upload_request = SstUploadRequest {
@@ -311,7 +339,7 @@ mod tests {
             .read(&write_cache.file_cache.cache_file_path(key))
             .await
             .unwrap();
-        assert_eq!(remote_data, cache_data);
+        assert_eq!(remote_data.to_vec(), cache_data.to_vec());
 
         // Check write cache contains the index key
         let index_key = IndexKey::new(region_id, file_id, FileType::Puffin);
@@ -322,7 +350,7 @@ mod tests {
             .read(&write_cache.file_cache.cache_file_path(index_key))
             .await
             .unwrap();
-        assert_eq!(remote_index_data, cache_index_data);
+        assert_eq!(remote_index_data.to_vec(), cache_index_data.to_vec());
     }
 
     #[tokio::test]
@@ -357,15 +385,15 @@ mod tests {
 
         // Write to local cache and upload sst to mock remote store
         let write_request = SstWriteRequest {
+            op_type: OperationType::Flush,
             file_id,
             metadata,
             source,
             storage: None,
-            create_inverted_index: false,
-            mem_threshold_index_create: None,
-            index_write_buffer_size: None,
             cache_manager: cache_manager.clone(),
             index_options: IndexOptions::default(),
+            inverted_index_config: Default::default(),
+            fulltext_index_config: Default::default(),
         };
         let write_opts = WriteOptions {
             row_group_size: 512,

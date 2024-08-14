@@ -25,20 +25,22 @@ use std::time::Duration;
 use ahash::RandomState;
 use arrow::compute::{self, cast_with_options, CastOptions, SortColumn};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions, TimeUnit};
-use common_query::DfPhysicalPlan;
 use common_recordbatch::DfSendableRecordBatchStream;
 use datafusion::common::{Result as DataFusionResult, Statistics};
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::SessionState;
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::udaf::create_aggregate_expr as create_aggr_udf_expr;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
 use datafusion::physical_planner::create_physical_sort_expr;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::{get_arrayref_at_indices, get_row_at_idx};
-use datafusion_common::{DFField, DFSchema, DFSchemaRef, DataFusionError, ScalarValue};
+use datafusion_common::{DFSchema, DFSchemaRef, DataFusionError, ScalarValue};
+use datafusion_expr::expr::AggregateFunctionDefinition;
 use datafusion_expr::utils::{exprlist_to_fields, COUNT_STAR_EXPANSION};
 use datafusion_expr::{
     lit, Accumulator, AggregateFunction, Expr, ExprSchemable, LogicalPlan,
@@ -46,9 +48,9 @@ use datafusion_expr::{
 };
 use datafusion_physical_expr::aggregate::utils::down_cast_any_ref;
 use datafusion_physical_expr::expressions::create_aggregate_expr as create_aggr_expr;
-use datafusion_physical_expr::hash_utils::create_hashes;
 use datafusion_physical_expr::{
-    create_physical_expr, AggregateExpr, Distribution, PhysicalExpr, PhysicalSortExpr,
+    create_physical_expr, AggregateExpr, Distribution, EquivalenceProperties, Partitioning,
+    PhysicalExpr, PhysicalSortExpr,
 };
 use datatypes::arrow::array::{
     Array, ArrayRef, TimestampMillisecondArray, TimestampMillisecondBuilder, UInt32Builder,
@@ -181,7 +183,7 @@ impl Accumulator for RangeFirstListValueAcc {
         Ok(())
     }
 
-    fn evaluate(&self) -> DataFusionResult<ScalarValue> {
+    fn evaluate(&mut self) -> DataFusionResult<ScalarValue> {
         Ok(self.data.clone().unwrap_or(ScalarValue::Null))
     }
 
@@ -189,7 +191,7 @@ impl Accumulator for RangeFirstListValueAcc {
         std::mem::size_of_val(self)
     }
 
-    fn state(&self) -> DataFusionResult<Vec<ScalarValue>> {
+    fn state(&mut self) -> DataFusionResult<Vec<ScalarValue>> {
         unreachable!("Accumulator::state will not be used in range query")
     }
 
@@ -466,12 +468,13 @@ impl RangeSelect {
                      fill,
                      ..
                  }| {
-                    Ok(DFField::new_unqualified(
+                    let field = Field::new(
                         name,
                         data_type.clone(),
                         // Only when data fill with Const option, the data can't be null
                         !matches!(fill, Some(Fill::Const(..))),
-                    ))
+                    );
+                    Ok((None, Arc::new(field)))
                 },
             )
             .collect::<DfResult<Vec<_>>>()
@@ -480,11 +483,10 @@ impl RangeSelect {
         let ts_field = time_index
             .to_field(input.schema().as_ref())
             .context(DataFusionSnafu)?;
-        let time_index_name = ts_field.name().clone();
+        let time_index_name = ts_field.1.name().clone();
         fields.push(ts_field);
         // add by
-        let by_fields =
-            exprlist_to_fields(by.iter().collect::<Vec<_>>(), &input).context(DataFusionSnafu)?;
+        let by_fields = exprlist_to_fields(&by, &input).context(DataFusionSnafu)?;
         fields.extend(by_fields.clone());
         let schema_before_project = Arc::new(
             DFSchema::new_with_metadata(fields, input.schema().metadata().clone())
@@ -494,18 +496,23 @@ impl RangeSelect {
             DFSchema::new_with_metadata(by_fields, input.schema().metadata().clone())
                 .context(DataFusionSnafu)?,
         );
-        // If the results of project plan can be obtained directly from range plan without any additional calculations, no project plan is required.
-        // We can simply project the final output of the range plan to produce the final result.
+        // If the results of project plan can be obtained directly from range plan without any additional
+        // calculations, no project plan is required. We can simply project the final output of the range
+        // plan to produce the final result.
         let schema_project = projection_expr
             .iter()
             .map(|project_expr| {
                 if let Expr::Column(column) = project_expr {
                     schema_before_project
                         .index_of_column_by_name(column.relation.as_ref(), &column.name)
-                        .unwrap_or(None)
                         .ok_or(())
                 } else {
-                    Err(())
+                    let (qualifier, field) = project_expr
+                        .to_field(input.schema().as_ref())
+                        .map_err(|_| ())?;
+                    schema_before_project
+                        .index_of_column_by_name(qualifier.as_ref(), field.name())
+                        .ok_or(())
                 }
             })
             .collect::<std::result::Result<Vec<usize>, ()>>()
@@ -513,7 +520,10 @@ impl RangeSelect {
         let schema = if let Some(project) = &schema_project {
             let project_field = project
                 .iter()
-                .map(|i| schema_before_project.fields()[*i].clone())
+                .map(|i| {
+                    let f = schema_before_project.qualified_field(*i);
+                    (f.0.cloned(), Arc::new(f.1.clone()))
+                })
                 .collect();
             Arc::new(
                 DFSchema::new_with_metadata(project_field, input.schema().metadata().clone())
@@ -555,6 +565,8 @@ impl UserDefinedLogicalNodeCore for RangeSelect {
         self.range_expr
             .iter()
             .map(|expr| expr.expr.clone())
+            .chain([self.time_expr.clone()])
+            .chain(self.by.clone())
             .collect()
     }
 
@@ -578,22 +590,49 @@ impl UserDefinedLogicalNodeCore for RangeSelect {
         )
     }
 
-    fn from_template(&self, _exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-        assert!(!inputs.is_empty());
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        if inputs.is_empty() {
+            return Err(DataFusionError::Plan(
+                "RangeSelect: inputs is empty".to_string(),
+            ));
+        }
+        if exprs.len() != self.range_expr.len() + self.by.len() + 1 {
+            return Err(DataFusionError::Plan(
+                "RangeSelect: exprs length not match".to_string(),
+            ));
+        }
 
-        Self {
+        let range_expr = exprs
+            .iter()
+            .zip(self.range_expr.iter())
+            .map(|(e, range)| RangeFn {
+                name: range.name.clone(),
+                data_type: range.data_type.clone(),
+                expr: e.clone(),
+                range: range.range,
+                fill: range.fill.clone(),
+                need_cast: range.need_cast,
+            })
+            .collect();
+        let time_expr = exprs[self.range_expr.len()].clone();
+        let by = exprs[self.range_expr.len() + 1..].to_vec();
+        Ok(Self {
             align: self.align,
             align_to: self.align_to,
-            range_expr: self.range_expr.clone(),
+            range_expr,
             input: Arc::new(inputs[0].clone()),
             time_index: self.time_index.clone(),
-            time_expr: self.time_expr.clone(),
+            time_expr,
             schema: self.schema.clone(),
-            by: self.by.clone(),
+            by,
             by_schema: self.by_schema.clone(),
             schema_project: self.schema_project.clone(),
             schema_before_project: self.schema_before_project.clone(),
-        }
+        })
     }
 }
 
@@ -603,7 +642,6 @@ impl RangeSelect {
         is_count_aggr: bool,
         exprs: &[Expr],
         df_schema: &Arc<DFSchema>,
-        schema: &Schema,
         session_state: &SessionState,
     ) -> DfResult<Vec<Arc<dyn PhysicalExpr>>> {
         exprs
@@ -614,13 +652,12 @@ impl RangeSelect {
                 // At this time, aggregate plan has been replaced by a custom range plan,
                 // so `CountWildcardRule` has not been applied.
                 // We manually modify it when creating the physical plan.
-                Expr::Wildcard if is_count_aggr => create_physical_expr(
+                Expr::Wildcard { .. } if is_count_aggr => create_physical_expr(
                     &lit(COUNT_STAR_EXPANSION),
-                    df_schema,
-                    schema,
+                    df_schema.as_ref(),
                     session_state.execution_props(),
                 ),
-                _ => create_physical_expr(e, df_schema, schema, session_state.execution_props()),
+                _ => create_physical_expr(e, df_schema.as_ref(), session_state.execution_props()),
             })
             .collect::<DfResult<Vec<_>>>()
     }
@@ -649,11 +686,19 @@ impl RangeSelect {
             .range_expr
             .iter()
             .map(|range_fn| {
-                let expr = match &range_fn.expr {
+                let name = range_fn.expr.display_name()?;
+                let range_expr = match &range_fn.expr {
+                    Expr::Alias(expr) => expr.expr.as_ref(),
+                    others => others,
+                };
+
+                let expr = match &range_expr {
                     Expr::AggregateFunction(aggr)
-                        if aggr.fun == AggregateFunction::FirstValue
-                            || aggr.fun == AggregateFunction::LastValue =>
+                        if (aggr.func_def.name() == "last_value"
+                            || aggr.func_def.name() == "first_value") =>
                     {
+                        let is_last_value_func = aggr.func_def.name() == "last_value";
+
                         // Because we only need to find the first_value/last_value,
                         // the complexity of sorting the entire batch is O(nlogn).
                         // We can sort the batch with limit 1.
@@ -665,13 +710,12 @@ impl RangeSelect {
                                 .map(|x| {
                                     create_physical_sort_expr(
                                         x,
-                                        input_dfschema,
-                                        &input_schema,
+                                        input_dfschema.as_ref(),
                                         session_state.execution_props(),
                                     )
                                     .map(|expr| {
                                         // reverse the last_value sort
-                                        if aggr.fun == AggregateFunction::LastValue {
+                                        if is_last_value_func {
                                             PhysicalSortExpr {
                                                 expr: expr.expr,
                                                 options: SortOptions {
@@ -689,14 +733,13 @@ impl RangeSelect {
                             // if user not assign order by, time index is needed as default ordering
                             let time_index = create_physical_expr(
                                 &self.time_expr,
-                                input_dfschema,
-                                &input_schema,
+                                input_dfschema.as_ref(),
                                 session_state.execution_props(),
                             )?;
                             vec![PhysicalSortExpr {
                                 expr: time_index,
                                 options: SortOptions {
-                                    descending: aggr.fun == AggregateFunction::LastValue,
+                                    descending: is_last_value_func,
                                     nulls_first: false,
                                 },
                             }]
@@ -705,7 +748,6 @@ impl RangeSelect {
                             false,
                             &aggr.args,
                             input_dfschema,
-                            &input_schema,
                             session_state,
                         )?;
                         // first_value/last_value has only one param.
@@ -723,8 +765,7 @@ impl RangeSelect {
                                 .map(|x| {
                                     create_physical_sort_expr(
                                         x,
-                                        input_dfschema,
-                                        &input_schema,
+                                        input_dfschema.as_ref(),
                                         session_state.execution_props(),
                                     )
                                 })
@@ -732,40 +773,41 @@ impl RangeSelect {
                         } else {
                             vec![]
                         };
-                        let expr = create_aggr_expr(
-                            &aggr.fun,
-                            false,
-                            &self.create_physical_expr_list(
-                                aggr.fun == AggregateFunction::Count,
-                                &aggr.args,
-                                input_dfschema,
-                                &input_schema,
-                                session_state,
-                            )?,
-                            &order_by,
-                            &input_schema,
-                            range_fn.expr.display_name()?,
+
+                        let input_phy_exprs = self.create_physical_expr_list(
+                            matches!(
+                                aggr.func_def,
+                                AggregateFunctionDefinition::BuiltIn(AggregateFunction::Count,)
+                            ),
+                            &aggr.args,
+                            input_dfschema,
+                            session_state,
                         )?;
-                        Ok(expr)
-                    }
-                    Expr::AggregateUDF(aggr_udf) => {
-                        let expr = create_aggr_udf_expr(
-                            &aggr_udf.fun,
-                            &self.create_physical_expr_list(
+                        match &aggr.func_def {
+                            AggregateFunctionDefinition::BuiltIn(fun) => create_aggr_expr(
+                                fun,
                                 false,
-                                &aggr_udf.args,
-                                input_dfschema,
+                                &input_phy_exprs,
+                                &order_by,
                                 &input_schema,
-                                session_state,
-                            )?,
-                            &input_schema,
-                            range_fn.expr.display_name()?,
-                        )?;
-                        Ok(expr)
+                                name,
+                                false,
+                            ),
+                            AggregateFunctionDefinition::UDF(fun) => create_aggr_udf_expr(
+                                fun,
+                                &input_phy_exprs,
+                                &[],
+                                &[],
+                                &input_schema,
+                                name,
+                                false,
+                                false,
+                            ),
+                        }
                     }
                     _ => Err(DataFusionError::Plan(format!(
-                        "Unexpected Expr:{} in RangeSelect",
-                        range_fn.expr.display_name()?
+                        "Unexpected Expr: {} in RangeSelect",
+                        range_fn.expr.canonical_name()
                     ))),
                 }?;
                 let args = expr.expressions();
@@ -788,24 +830,25 @@ impl RangeSelect {
         } else {
             schema_before_project.clone()
         };
+        let by = self.create_physical_expr_list(false, &self.by, input_dfschema, session_state)?;
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
         Ok(Arc::new(RangeSelectExec {
             input: exec_input,
             range_exec,
             align: self.align.as_millis() as Millisecond,
             align_to: self.align_to,
-            by: self.create_physical_expr_list(
-                false,
-                &self.by,
-                input_dfschema,
-                &input_schema,
-                session_state,
-            )?,
+            by,
             time_index: self.time_index.clone(),
             schema,
             by_schema: Arc::new(Schema::new(by_fields)),
             metric: ExecutionPlanMetricsSet::new(),
             schema_before_project,
             schema_project: self.schema_project.clone(),
+            cache,
         }))
     }
 }
@@ -848,6 +891,7 @@ pub struct RangeSelectExec {
     metric: ExecutionPlanMetricsSet,
     schema_project: Option<Vec<usize>>,
     schema_before_project: SchemaRef,
+    cache: PlanProperties,
 }
 
 impl DisplayAs for RangeSelectExec {
@@ -882,26 +926,22 @@ impl ExecutionPlan for RangeSelectExec {
         self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
     }
 
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn DfPhysicalPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn DfPhysicalPlan>>,
-    ) -> datafusion_common::Result<Arc<dyn DfPhysicalPlan>> {
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         assert!(!children.is_empty());
         Ok(Arc::new(Self {
             input: children[0].clone(),
@@ -915,13 +955,14 @@ impl ExecutionPlan for RangeSelectExec {
             metric: self.metric.clone(),
             schema_before_project: self.schema_before_project.clone(),
             schema_project: self.schema_project.clone(),
+            cache: self.cache.clone(),
         }))
     }
 
     fn execute(
         &self,
         partition: usize,
-        context: Arc<common_query::physical_plan::TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DfResult<DfSendableRecordBatchStream> {
         let baseline_metric = BaselineMetrics::new(&self.metric, partition);
         let input = self.input.execute(partition, context)?;
@@ -963,8 +1004,8 @@ impl ExecutionPlan for RangeSelectExec {
         Some(self.metric.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        self.input.statistics()
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(Statistics::new_unknown(self.schema.as_ref()))
     }
 }
 
@@ -1054,7 +1095,7 @@ impl RangeSelectStream {
             .iter()
             .map(|expr| {
                 let value = expr.evaluate(batch)?;
-                Ok(value.into_array(batch.num_rows()))
+                value.into_array(batch.num_rows())
             })
             .collect::<DfResult<Vec<_>>>()
     }
@@ -1079,9 +1120,11 @@ impl RangeSelectStream {
         let ts_column_ref = ts_column
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
-            .ok_or(DataFusionError::Execution(
-                "Time index Column downcast to TimestampMillisecondArray failed".into(),
-            ))?;
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Time index Column downcast to TimestampMillisecondArray failed".into(),
+                )
+            })?;
         for i in 0..self.range_exec.len() {
             let args = self.evaluate_many(&batch, &self.range_exec[i].args)?;
             // use self.modify_map record (hash, align_ts) => [row_nums]
@@ -1168,7 +1211,7 @@ impl RangeSelectStream {
         for SeriesState {
             row,
             align_ts_accumulator,
-        } in self.series_map.values()
+        } in self.series_map.values_mut()
         {
             // skip empty time series
             if align_ts_accumulator.is_empty() {
@@ -1184,8 +1227,8 @@ impl RangeSelectStream {
                 align_ts_accumulator.keys().copied().collect::<Vec<_>>()
             };
             for ts in &align_ts {
-                if let Some(slot) = align_ts_accumulator.get(ts) {
-                    for (column, acc) in all_scalar.iter_mut().zip(slot.iter()) {
+                if let Some(slot) = align_ts_accumulator.get_mut(ts) {
+                    for (column, acc) in all_scalar.iter_mut().zip(slot.iter_mut()) {
                         column.push(acc.evaluate()?);
                     }
                 } else {
@@ -1415,6 +1458,11 @@ mod test {
             Field::new(TIME_INDEX_COLUMN, TimestampMillisecondType::DATA_TYPE, true),
             Field::new("host", DataType::Utf8, true),
         ]));
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
         let range_select_exec = Arc::new(RangeSelectExec {
             input: memory_exec,
             range_exec: vec![
@@ -1450,6 +1498,7 @@ mod test {
             schema_project: None,
             by_schema: Arc::new(Schema::new(vec![Field::new("host", DataType::Utf8, true)])),
             metric: ExecutionPlanMetricsSet::new(),
+            cache,
         });
         let sort_exec = SortExec::new(
             vec![

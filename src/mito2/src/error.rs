@@ -20,15 +20,20 @@ use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_runtime::JoinError;
+use common_time::timestamp::TimeUnit;
+use common_time::Timestamp;
 use datatypes::arrow::error::ArrowError;
 use datatypes::prelude::ConcreteDataType;
 use object_store::ErrorKind;
 use prost::{DecodeError, EncodeError};
 use snafu::{Location, Snafu};
+use store_api::logstore::provider::Provider;
 use store_api::manifest::ManifestVersion;
 use store_api::storage::RegionId;
 
 use crate::cache::file_cache::FileType;
+use crate::region::RegionState;
+use crate::schedule::remote_job_scheduler::JobId;
 use crate::sst::file::FileId;
 use crate::worker::WorkerId;
 
@@ -41,6 +46,7 @@ pub enum Error {
     region_id, expected_last_entry_id, replayed_last_entry_id
     ))]
     UnexpectedReplay {
+        #[snafu(implicit)]
         location: Location,
         region_id: RegionId,
         expected_last_entry_id: u64,
@@ -49,6 +55,7 @@ pub enum Error {
 
     #[snafu(display("OpenDAL operator failed"))]
     OpenDal {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: object_store::Error,
@@ -72,6 +79,7 @@ pub enum Error {
 
     #[snafu(display("Failed to ser/de json object"))]
     SerdeJson {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: serde_json::Error,
@@ -81,56 +89,67 @@ pub enum Error {
     InvalidScanIndex {
         start: ManifestVersion,
         end: ManifestVersion,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid UTF-8 content"))]
     Utf8 {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: std::str::Utf8Error,
     },
 
     #[snafu(display("Cannot find RegionMetadata"))]
-    RegionMetadataNotFound { location: Location },
+    RegionMetadataNotFound {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to join handle"))]
     Join {
         #[snafu(source)]
         error: common_runtime::JoinError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Worker {} is stopped", id))]
-    WorkerStopped { id: WorkerId, location: Location },
+    WorkerStopped {
+        id: WorkerId,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to recv result"))]
     Recv {
         #[snafu(source)]
         error: tokio::sync::oneshot::error::RecvError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid metadata, {}", reason))]
-    InvalidMeta { reason: String, location: Location },
+    InvalidMeta {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid region metadata"))]
     InvalidMetadata {
         source: store_api::metadata::MetadataError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to create RecordBatch from vectors"))]
     NewRecordBatch {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: ArrowError,
-    },
-
-    #[snafu(display("Failed to write to buffer"))]
-    WriteBuffer {
-        location: Location,
-        source: common_datasource::error::Error,
     },
 
     #[snafu(display("Failed to read parquet file, path: {}", path))]
@@ -138,18 +157,29 @@ pub enum Error {
         path: String,
         #[snafu(source)]
         error: parquet::errors::ParquetError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to write parquet file"))]
+    WriteParquet {
+        #[snafu(source)]
+        error: parquet::errors::ParquetError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Region {} not found", region_id))]
     RegionNotFound {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Object store not found: {}", object_store))]
     ObjectStoreNotFound {
         object_store: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -157,6 +187,7 @@ pub enum Error {
     RegionCorrupted {
         region_id: RegionId,
         reason: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -164,6 +195,7 @@ pub enum Error {
     InvalidRequest {
         region_id: RegionId,
         reason: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -174,6 +206,7 @@ pub enum Error {
     ConvertColumnDataType {
         reason: String,
         source: api::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -196,9 +229,18 @@ pub enum Error {
         source: datatypes::Error,
     },
 
+    #[snafu(display("Failed to build entry, region_id: {}", region_id))]
+    BuildEntry {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+        source: BoxedError,
+    },
+
     #[snafu(display("Failed to encode WAL entry, region_id: {}", region_id))]
     EncodeWal {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: EncodeError,
@@ -206,13 +248,15 @@ pub enum Error {
 
     #[snafu(display("Failed to write WAL"))]
     WriteWal {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
-    #[snafu(display("Failed to read WAL, region_id: {}", region_id))]
+    #[snafu(display("Failed to read WAL, provider: {}", provider))]
     ReadWal {
-        region_id: RegionId,
+        provider: Provider,
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
@@ -220,6 +264,7 @@ pub enum Error {
     #[snafu(display("Failed to decode WAL entry, region_id: {}", region_id))]
     DecodeWal {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: DecodeError,
@@ -228,6 +273,7 @@ pub enum Error {
     #[snafu(display("Failed to delete WAL, region_id: {}", region_id))]
     DeleteWal {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
@@ -243,6 +289,7 @@ pub enum Error {
     SerializeField {
         #[snafu(source)]
         error: memcomparable::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -252,6 +299,7 @@ pub enum Error {
     ))]
     NotSupportedField {
         data_type: ConcreteDataType,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -259,6 +307,7 @@ pub enum Error {
     DeserializeField {
         #[snafu(source)]
         error: memcomparable::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -266,23 +315,41 @@ pub enum Error {
     InvalidParquet {
         file: String,
         reason: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid batch, {}", reason))]
-    InvalidBatch { reason: String, location: Location },
+    InvalidBatch {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid arrow record batch, {}", reason))]
-    InvalidRecordBatch { reason: String, location: Location },
+    InvalidRecordBatch {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid wal read request, {}", reason))]
+    InvalidWalReadRequest {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to convert array to vector"))]
     ConvertVector {
+        #[snafu(implicit)]
         location: Location,
         source: datatypes::error::Error,
     },
 
     #[snafu(display("Failed to compute arrow arrays"))]
     ComputeArrow {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: datatypes::arrow::error::ArrowError,
@@ -290,6 +357,7 @@ pub enum Error {
 
     #[snafu(display("Failed to compute vector"))]
     ComputeVector {
+        #[snafu(implicit)]
         location: Location,
         source: datatypes::error::Error,
     },
@@ -298,19 +366,27 @@ pub enum Error {
     PrimaryKeyLengthMismatch {
         expect: usize,
         actual: usize,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid sender",))]
-    InvalidSender { location: Location },
+    InvalidSender {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid scheduler state"))]
-    InvalidSchedulerState { location: Location },
+    InvalidSchedulerState {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to stop scheduler"))]
     StopScheduler {
         #[snafu(source)]
         error: JoinError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -319,6 +395,7 @@ pub enum Error {
         file_id: FileId,
         #[snafu(source)]
         error: object_store::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -327,6 +404,7 @@ pub enum Error {
         file_id: FileId,
         #[snafu(source)]
         error: object_store::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -334,24 +412,28 @@ pub enum Error {
     FlushRegion {
         region_id: RegionId,
         source: Arc<Error>,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Region {} is dropped", region_id))]
     RegionDropped {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Region {} is closed", region_id))]
     RegionClosed {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Region {} is truncated", region_id))]
     RegionTruncated {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -361,6 +443,7 @@ pub enum Error {
     ))]
     RejectWrite {
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -368,6 +451,7 @@ pub enum Error {
     CompactRegion {
         region_id: RegionId,
         source: Arc<Error>,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -379,12 +463,14 @@ pub enum Error {
     CompatReader {
         region_id: RegionId,
         reason: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalue region req"))]
     InvalidRegionRequest {
         source: store_api::metadata::MetadataError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -392,12 +478,16 @@ pub enum Error {
     InvalidRegionRequestSchemaVersion {
         expect: u64,
         actual: u64,
+        #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Region {} is read only", region_id))]
-    RegionReadonly {
+    #[snafu(display("Region {} is in {:?} state, expect: {:?}", region_id, state, expect))]
+    RegionState {
         region_id: RegionId,
+        state: RegionState,
+        expect: RegionState,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -405,6 +495,7 @@ pub enum Error {
     JsonOptions {
         #[snafu(source)]
         error: serde_json::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -416,12 +507,14 @@ pub enum Error {
     EmptyRegionDir {
         region_id: RegionId,
         region_dir: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Empty manifest directory, manifest_dir: {}", manifest_dir,))]
     EmptyManifestDir {
         manifest_dir: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -430,79 +523,84 @@ pub enum Error {
         path: String,
         #[snafu(source)]
         error: ArrowError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid file metadata"))]
     ConvertMetaData {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: parquet::errors::ParquetError,
     },
 
     #[snafu(display("Column not found, column: {column}"))]
-    ColumnNotFound { column: String, location: Location },
+    ColumnNotFound {
+        column: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to build index applier"))]
     BuildIndexApplier {
         source: index::inverted_index::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to convert value"))]
     ConvertValue {
         source: datatypes::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Failed to apply index"))]
-    ApplyIndex {
+    #[snafu(display("Failed to apply inverted index"))]
+    ApplyInvertedIndex {
         source: index::inverted_index::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to push index value"))]
     PushIndexValue {
         source: index::inverted_index::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to write index completely"))]
     IndexFinish {
         source: index::inverted_index::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Operate on aborted index"))]
-    OperateAbortedIndex { location: Location },
+    OperateAbortedIndex {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to read puffin metadata"))]
     PuffinReadMetadata {
         source: puffin::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to read puffin blob"))]
     PuffinReadBlob {
         source: puffin::error::Error,
-        location: Location,
-    },
-
-    #[snafu(display("Blob type not found, blob_type: {blob_type}"))]
-    PuffinBlobTypeNotFound {
-        blob_type: String,
-        location: Location,
-    },
-
-    #[snafu(display("Failed to write puffin completely"))]
-    PuffinFinish {
-        source: puffin::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to add blob to puffin file"))]
     PuffinAddBlob {
         source: puffin::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -511,11 +609,16 @@ pub enum Error {
         dir: String,
         #[snafu(source)]
         error: std::io::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid config, {reason}"))]
-    InvalidConfig { reason: String, location: Location },
+    InvalidConfig {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display(
         "Stale log entry found during replay, region: {}, flushed: {}, replayed: {}",
@@ -527,6 +630,13 @@ pub enum Error {
         region_id: RegionId,
         flushed_entry_id: u64,
         unexpected_entry_id: u64,
+    },
+
+    #[snafu(display("Read the corrupted log entry, region_id: {}", region_id))]
+    CorruptedEntry {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display(
@@ -541,12 +651,14 @@ pub enum Error {
         file_type: FileType,
         #[snafu(source)]
         error: std::io::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to filter record batch"))]
     FilterRecordBatch {
         source: common_recordbatch::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -554,16 +666,29 @@ pub enum Error {
     BiError {
         first: Box<Error>,
         second: Box<Error>,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Encode null value"))]
-    IndexEncodeNull { location: Location },
+    IndexEncodeNull {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to encode memtable to Parquet bytes"))]
     EncodeMemtable {
         #[snafu(source)]
         error: parquet::errors::ParquetError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Partition {} out of range, {} in total", given, all))]
+    PartitionOutOfRange {
+        given: usize,
+        all: usize,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -571,6 +696,151 @@ pub enum Error {
     ReadDataPart {
         #[snafu(source)]
         error: parquet::errors::ParquetError,
+    },
+
+    #[snafu(display("Invalid region options, {}", reason))]
+    InvalidRegionOptions {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("checksum mismatch (actual: {}, expected: {})", actual, expected))]
+    ChecksumMismatch { actual: u32, expected: u32 },
+
+    #[snafu(display("Region {} is stopped", region_id))]
+    RegionStopped {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Time range predicate overflows, timestamp: {:?}, target unit: {}",
+        timestamp,
+        unit
+    ))]
+    TimeRangePredicateOverflow {
+        timestamp: Timestamp,
+        unit: TimeUnit,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to build time range filters for value: {:?}", timestamp))]
+    BuildTimeRangeFilter {
+        timestamp: Timestamp,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to open region"))]
+    OpenRegion {
+        #[snafu(implicit)]
+        location: Location,
+        source: Arc<Error>,
+    },
+
+    #[snafu(display("Failed to parse job id"))]
+    ParseJobId {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: uuid::Error,
+    },
+
+    #[snafu(display("Operation is not supported: {}", err_msg))]
+    UnsupportedOperation {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to remotely compact region {} by job {} due to {}",
+        region_id,
+        job_id,
+        reason
+    ))]
+    RemoteCompaction {
+        region_id: RegionId,
+        job_id: JobId,
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to initialize puffin stager"))]
+    PuffinInitStager {
+        source: puffin::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to build puffin reader"))]
+    PuffinBuildReader {
+        source: puffin::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to retrieve fulltext options from column metadata"))]
+    FulltextOptions {
+        #[snafu(implicit)]
+        location: Location,
+        source: datatypes::error::Error,
+        column_name: String,
+    },
+
+    #[snafu(display("Failed to create fulltext index creator"))]
+    CreateFulltextCreator {
+        source: index::fulltext_index::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to cast vector of {from} to {to}"))]
+    CastVector {
+        #[snafu(implicit)]
+        location: Location,
+        from: ConcreteDataType,
+        to: ConcreteDataType,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Failed to push text to fulltext index"))]
+    FulltextPushText {
+        source: index::fulltext_index::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to finalize fulltext index creator"))]
+    FulltextFinish {
+        source: index::fulltext_index::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to apply fulltext index"))]
+    ApplyFulltextIndex {
+        source: index::fulltext_index::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("SST file {} does not contain valid stats info", file_path))]
+    StatsNotPresent {
+        file_path: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to decode stats of file {}", file_path))]
+    DecodeStats {
+        file_path: String,
+        #[snafu(implicit)]
+        location: Location,
     },
 }
 
@@ -610,7 +880,6 @@ impl ErrorExt for Error {
             | CreateDefault { .. }
             | InvalidParquet { .. }
             | OperateAbortedIndex { .. }
-            | PuffinBlobTypeNotFound { .. }
             | UnexpectedReplay { .. }
             | IndexEncodeNull { .. } => StatusCode::Unexpected,
             RegionNotFound { .. } => StatusCode::RegionNotFound,
@@ -621,7 +890,11 @@ impl ErrorExt for Error {
             | FillDefault { .. }
             | ConvertColumnDataType { .. }
             | ColumnNotFound { .. }
-            | InvalidMetadata { .. } => StatusCode::InvalidArguments,
+            | InvalidMetadata { .. }
+            | InvalidRegionOptions { .. }
+            | InvalidWalReadRequest { .. }
+            | PartitionOutOfRange { .. }
+            | ParseJobId { .. } => StatusCode::InvalidArguments,
 
             InvalidRegionRequestSchemaVersion { .. } => StatusCode::RequestOutdated,
 
@@ -630,23 +903,32 @@ impl ErrorExt for Error {
             | WorkerStopped { .. }
             | Recv { .. }
             | EncodeWal { .. }
-            | DecodeWal { .. } => StatusCode::Internal,
-            WriteBuffer { source, .. } => source.status_code(),
+            | ConvertMetaData { .. }
+            | DecodeWal { .. }
+            | ComputeArrow { .. }
+            | BiError { .. }
+            | StopScheduler { .. }
+            | ComputeVector { .. }
+            | SerializeField { .. }
+            | EncodeMemtable { .. }
+            | ReadDataPart { .. }
+            | CorruptedEntry { .. }
+            | BuildEntry { .. } => StatusCode::Internal,
+
+            OpenRegion { source, .. } => source.status_code(),
+
+            WriteParquet { .. } => StatusCode::StorageUnavailable,
             WriteGroup { source, .. } => source.status_code(),
             FieldTypeMismatch { source, .. } => source.status_code(),
-            SerializeField { .. } => StatusCode::Internal,
             NotSupportedField { .. } => StatusCode::Unsupported,
             DeserializeField { .. } => StatusCode::Unexpected,
             InvalidBatch { .. } => StatusCode::InvalidArguments,
             InvalidRecordBatch { .. } => StatusCode::InvalidArguments,
             ConvertVector { source, .. } => source.status_code(),
-            ConvertMetaData { .. } => StatusCode::Internal,
-            ComputeArrow { .. } => StatusCode::Internal,
-            ComputeVector { .. } => StatusCode::Internal,
+
             PrimaryKeyLengthMismatch { .. } => StatusCode::InvalidArguments,
             InvalidSender { .. } => StatusCode::InvalidArguments,
             InvalidSchedulerState { .. } => StatusCode::InvalidArguments,
-            StopScheduler { .. } => StatusCode::Internal,
             DeleteSst { .. } | DeleteIndex { .. } => StatusCode::StorageUnavailable,
             FlushRegion { source, .. } => source.status_code(),
             RegionDropped { .. } => StatusCode::Cancelled,
@@ -656,26 +938,41 @@ impl ErrorExt for Error {
             CompactRegion { source, .. } => source.status_code(),
             CompatReader { .. } => StatusCode::Unexpected,
             InvalidRegionRequest { source, .. } => source.status_code(),
-            RegionReadonly { .. } => StatusCode::RegionReadonly,
+            RegionState { .. } => StatusCode::RegionNotReady,
             JsonOptions { .. } => StatusCode::InvalidArguments,
             EmptyRegionDir { .. } | EmptyManifestDir { .. } => StatusCode::RegionNotFound,
             ArrowReader { .. } => StatusCode::StorageUnavailable,
             ConvertValue { source, .. } => source.status_code(),
             BuildIndexApplier { source, .. }
             | PushIndexValue { source, .. }
-            | ApplyIndex { source, .. }
+            | ApplyInvertedIndex { source, .. }
             | IndexFinish { source, .. } => source.status_code(),
             PuffinReadMetadata { source, .. }
             | PuffinReadBlob { source, .. }
-            | PuffinFinish { source, .. }
-            | PuffinAddBlob { source, .. } => source.status_code(),
+            | PuffinAddBlob { source, .. }
+            | PuffinInitStager { source, .. }
+            | PuffinBuildReader { source, .. } => source.status_code(),
             CleanDir { .. } => StatusCode::Unexpected,
             InvalidConfig { .. } => StatusCode::InvalidArguments,
             StaleLogEntry { .. } => StatusCode::Unexpected,
+
             FilterRecordBatch { source, .. } => source.status_code(),
+
             Upload { .. } => StatusCode::StorageUnavailable,
-            BiError { .. } => StatusCode::Internal,
-            EncodeMemtable { .. } | ReadDataPart { .. } => StatusCode::Internal,
+            ChecksumMismatch { .. } => StatusCode::Unexpected,
+            RegionStopped { .. } => StatusCode::RegionNotReady,
+            TimeRangePredicateOverflow { .. } => StatusCode::InvalidArguments,
+            BuildTimeRangeFilter { .. } => StatusCode::Unexpected,
+            UnsupportedOperation { .. } => StatusCode::Unsupported,
+            RemoteCompaction { .. } => StatusCode::Unexpected,
+
+            FulltextOptions { source, .. } => source.status_code(),
+            CreateFulltextCreator { source, .. } => source.status_code(),
+            CastVector { source, .. } => source.status_code(),
+            FulltextPushText { source, .. }
+            | FulltextFinish { source, .. }
+            | ApplyFulltextIndex { source, .. } => source.status_code(),
+            DecodeStats { .. } | StatsNotPresent { .. } => StatusCode::Internal,
         }
     }
 

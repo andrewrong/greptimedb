@@ -81,9 +81,7 @@ impl RegionHeartbeatResponseHandler {
             Instruction::UpgradeRegion(upgrade_region) => Ok(Box::new(move |handler_context| {
                 handler_context.handle_upgrade_region_instruction(upgrade_region)
             })),
-            Instruction::InvalidateTableIdCache(_) | Instruction::InvalidateTableNameCache(_) => {
-                InvalidHeartbeatResponseSnafu.fail()
-            }
+            Instruction::InvalidateCaches(_) => InvalidHeartbeatResponseSnafu.fail(),
         }
     }
 }
@@ -110,7 +108,7 @@ impl HeartbeatResponseHandler for RegionHeartbeatResponseHandler {
         let region_server = self.region_server.clone();
         let catchup_tasks = self.catchup_tasks.clone();
         let handler = Self::build_handler(instruction)?;
-        let _handle = common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_global(async move {
             let reply = handler(HandlerContext {
                 region_server,
                 catchup_tasks,

@@ -14,7 +14,8 @@
 
 use std::sync::Arc;
 
-use api::v1::region::{QueryRequest, RegionRequest, RegionResponse};
+use api::region::RegionResponse;
+use api::v1::region::RegionRequest;
 use api::v1::ResponseHeader;
 use arc_swap::ArcSwapOption;
 use arrow_flight::Ticket;
@@ -23,14 +24,17 @@ use async_trait::async_trait;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_grpc::flight::{FlightDecoder, FlightMessage};
-use common_meta::datanode_manager::{AffectedRows, Datanode};
 use common_meta::error::{self as meta_error, Result as MetaResult};
+use common_meta::node_manager::Datanode;
+use common_query::request::QueryRequest;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::error;
 use common_telemetry::tracing_context::TracingContext;
 use prost::Message;
+use query::query_engine::DefaultSerializer;
 use snafu::{location, Location, OptionExt, ResultExt};
+use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use tokio_stream::StreamExt;
 
 use crate::error::{
@@ -46,7 +50,7 @@ pub struct RegionRequester {
 
 #[async_trait]
 impl Datanode for RegionRequester {
-    async fn handle(&self, request: RegionRequest) -> MetaResult<AffectedRows> {
+    async fn handle(&self, request: RegionRequest) -> MetaResult<RegionResponse> {
         self.handle_inner(request).await.map_err(|err| {
             if err.should_retry() {
                 meta_error::Error::RetryLater {
@@ -62,6 +66,17 @@ impl Datanode for RegionRequester {
     }
 
     async fn handle_query(&self, request: QueryRequest) -> MetaResult<SendableRecordBatchStream> {
+        let plan = DFLogicalSubstraitConvertor
+            .encode(&request.plan, DefaultSerializer)
+            .map_err(BoxedError::new)
+            .context(meta_error::ExternalSnafu)?
+            .to_vec();
+        let request = api::v1::region::QueryRequest {
+            header: request.header,
+            region_id: request.region_id.as_u64(),
+            plan,
+        };
+
         let ticket = Ticket {
             ticket: request.encode_to_vec().into(),
         };
@@ -165,7 +180,7 @@ impl RegionRequester {
         Ok(Box::pin(record_batch_stream))
     }
 
-    async fn handle_inner(&self, request: RegionRequest) -> Result<AffectedRows> {
+    async fn handle_inner(&self, request: RegionRequest) -> Result<RegionResponse> {
         let request_type = request
             .body
             .as_ref()
@@ -176,12 +191,9 @@ impl RegionRequester {
             .with_label_values(&[request_type.as_str()])
             .start_timer();
 
-        let mut client = self.client.raw_region_client()?;
+        let (addr, mut client) = self.client.raw_region_client()?;
 
-        let RegionResponse {
-            header,
-            affected_rows,
-        } = client
+        let response = client
             .handle(request)
             .await
             .map_err(|e| {
@@ -189,25 +201,28 @@ impl RegionRequester {
                 let err: error::Error = e.into();
                 // Uses `Error::RegionServer` instead of `Error::Server`
                 error::Error::RegionServer {
+                    addr,
                     code,
                     source: BoxedError::new(err),
+                    location: location!(),
                 }
             })?
             .into_inner();
 
-        check_response_header(header)?;
+        check_response_header(&response.header)?;
 
-        Ok(affected_rows as _)
+        Ok(RegionResponse::from_region_response(response))
     }
 
-    pub async fn handle(&self, request: RegionRequest) -> Result<AffectedRows> {
+    pub async fn handle(&self, request: RegionRequest) -> Result<RegionResponse> {
         self.handle_inner(request).await
     }
 }
 
-pub fn check_response_header(header: Option<ResponseHeader>) -> Result<()> {
+pub fn check_response_header(header: &Option<ResponseHeader>) -> Result<()> {
     let status = header
-        .and_then(|header| header.status)
+        .as_ref()
+        .and_then(|header| header.status.as_ref())
         .context(IllegalDatabaseResponseSnafu {
             err_msg: "either response header or status is missing",
         })?;
@@ -221,7 +236,7 @@ pub fn check_response_header(header: Option<ResponseHeader>) -> Result<()> {
             })?;
         ServerSnafu {
             code,
-            msg: status.err_msg,
+            msg: status.err_msg.clone(),
         }
         .fail()
     }
@@ -236,19 +251,19 @@ mod test {
 
     #[test]
     fn test_check_response_header() {
-        let result = check_response_header(None);
+        let result = check_response_header(&None);
         assert!(matches!(
             result.unwrap_err(),
             IllegalDatabaseResponse { .. }
         ));
 
-        let result = check_response_header(Some(ResponseHeader { status: None }));
+        let result = check_response_header(&Some(ResponseHeader { status: None }));
         assert!(matches!(
             result.unwrap_err(),
             IllegalDatabaseResponse { .. }
         ));
 
-        let result = check_response_header(Some(ResponseHeader {
+        let result = check_response_header(&Some(ResponseHeader {
             status: Some(PbStatus {
                 status_code: StatusCode::Success as u32,
                 err_msg: String::default(),
@@ -256,7 +271,7 @@ mod test {
         }));
         assert!(result.is_ok());
 
-        let result = check_response_header(Some(ResponseHeader {
+        let result = check_response_header(&Some(ResponseHeader {
             status: Some(PbStatus {
                 status_code: u32::MAX,
                 err_msg: String::default(),
@@ -267,13 +282,13 @@ mod test {
             IllegalDatabaseResponse { .. }
         ));
 
-        let result = check_response_header(Some(ResponseHeader {
+        let result = check_response_header(&Some(ResponseHeader {
             status: Some(PbStatus {
                 status_code: StatusCode::Internal as u32,
                 err_msg: "blabla".to_string(),
             }),
         }));
-        let Server { code, msg } = result.unwrap_err() else {
+        let Server { code, msg, .. } = result.unwrap_err() else {
             unreachable!()
         };
         assert_eq!(code, StatusCode::Internal);

@@ -20,14 +20,18 @@ use std::sync::{Arc, RwLock, Weak};
 use async_stream::{stream, try_stream};
 use common_catalog::build_db_string;
 use common_catalog::consts::{
-    DEFAULT_CATALOG_NAME, DEFAULT_PRIVATE_SCHEMA_NAME, DEFAULT_SCHEMA_NAME, INFORMATION_SCHEMA_NAME,
+    DEFAULT_CATALOG_NAME, DEFAULT_PRIVATE_SCHEMA_NAME, DEFAULT_SCHEMA_NAME,
+    INFORMATION_SCHEMA_NAME, PG_CATALOG_NAME,
 };
+use common_meta::key::flow::FlowMetadataManager;
+use common_meta::kv_backend::memory::MemoryKvBackend;
 use futures_util::stream::BoxStream;
 use snafu::OptionExt;
 use table::TableRef;
 
 use crate::error::{CatalogNotFoundSnafu, Result, SchemaNotFoundSnafu, TableExistsSnafu};
 use crate::information_schema::InformationSchemaProvider;
+use crate::system_schema::SystemSchemaProvider;
 use crate::{CatalogManager, DeregisterTableRequest, RegisterSchemaRequest, RegisterTableRequest};
 
 type SchemaEntries = HashMap<String, HashMap<String, TableRef>>;
@@ -117,11 +121,7 @@ impl CatalogManager for MemoryCatalogManager {
         Ok(result)
     }
 
-    async fn tables<'a>(
-        &'a self,
-        catalog: &'a str,
-        schema: &'a str,
-    ) -> BoxStream<'a, Result<TableRef>> {
+    fn tables<'a>(&'a self, catalog: &'a str, schema: &'a str) -> BoxStream<'a, Result<TableRef>> {
         let catalogs = self.catalogs.read().unwrap();
 
         let Some(schemas) = catalogs.get(catalog) else {
@@ -141,11 +141,11 @@ impl CatalogManager for MemoryCatalogManager {
 
         let tables = tables.values().cloned().collect::<Vec<_>>();
 
-        return Box::pin(try_stream!({
+        Box::pin(try_stream!({
             for table in tables {
                 yield table;
             }
-        }));
+        }))
     }
 }
 
@@ -180,6 +180,12 @@ impl MemoryCatalogManager {
         manager
             .register_schema_sync(RegisterSchemaRequest {
                 catalog: DEFAULT_CATALOG_NAME.to_string(),
+                schema: PG_CATALOG_NAME.to_string(),
+            })
+            .unwrap();
+        manager
+            .register_schema_sync(RegisterSchemaRequest {
+                catalog: DEFAULT_CATALOG_NAME.to_string(),
                 schema: INFORMATION_SCHEMA_NAME.to_string(),
             })
             .unwrap();
@@ -200,7 +206,7 @@ impl MemoryCatalogManager {
     }
 
     fn catalog_exist_sync(&self, catalog: &str) -> Result<bool> {
-        Ok(self.catalogs.read().unwrap().get(catalog).is_some())
+        Ok(self.catalogs.read().unwrap().contains_key(catalog))
     }
 
     /// Registers a catalog if it does not exist and returns false if the schema exists.
@@ -294,6 +300,7 @@ impl MemoryCatalogManager {
         let information_schema_provider = InformationSchemaProvider::new(
             catalog,
             Arc::downgrade(self) as Weak<dyn CatalogManager>,
+            Arc::new(FlowMetadataManager::new(Arc::new(MemoryKvBackend::new()))),
         );
         let information_schema = information_schema_provider.tables().clone();
 
@@ -368,9 +375,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let stream = catalog_list
-            .tables(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME)
-            .await;
+        let stream = catalog_list.tables(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME);
         let tables = stream.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(tables.len(), 1);
         assert_eq!(

@@ -75,15 +75,18 @@ impl StatementExecutor {
             )
             .await
             .context(error::WriteStreamToFileSnafu { path }),
-            Format::Parquet(_) => stream_to_parquet(
-                Box::pin(DfRecordBatchStreamAdapter::new(stream)),
-                object_store,
-                path,
-                threshold,
-                WRITE_CONCURRENCY,
-            )
-            .await
-            .context(error::WriteStreamToFileSnafu { path }),
+            Format::Parquet(_) => {
+                let schema = stream.schema();
+                stream_to_parquet(
+                    Box::pin(DfRecordBatchStreamAdapter::new(stream)),
+                    schema,
+                    object_store,
+                    path,
+                    WRITE_CONCURRENCY,
+                )
+                .await
+                .context(error::WriteStreamToFileSnafu { path })
+            }
             _ => error::UnsupportedFormatSnafu { format: *format }.fail(),
         }
     }
@@ -110,7 +113,6 @@ impl StatementExecutor {
                     req.timestamp_range.as_ref(),
                 )
             })
-            .map(|filter| filter.df_expr().clone())
             .into_iter()
             .collect::<Vec<_>>();
 
@@ -118,7 +120,7 @@ impl StatementExecutor {
         let table_source = Arc::new(DefaultTableSource::new(table_provider));
 
         let mut builder = LogicalPlanBuilder::scan_with_filters(
-            df_table_ref.to_owned_reference(),
+            df_table_ref,
             table_source,
             None,
             filters.clone(),

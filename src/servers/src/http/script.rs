@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::{Query, RawBody, State};
@@ -26,19 +27,15 @@ use snafu::ResultExt;
 
 use crate::error::{HyperSnafu, InvalidUtf8ValueSnafu};
 use crate::http::error_result::ErrorResponse;
-use crate::http::{ApiState, GreptimedbV1Response, HttpResponse, ResponseFormat};
+use crate::http::{ApiState, GreptimedbV1Response, HttpResponse};
 
 macro_rules! json_err {
     ($e: expr) => {{
-        return HttpResponse::Error(ErrorResponse::from_error(ResponseFormat::GreptimedbV1, $e));
+        return HttpResponse::Error(ErrorResponse::from_error($e));
     }};
 
     ($msg: expr, $code: expr) => {{
-        return HttpResponse::Error(ErrorResponse::from_error_message(
-            ResponseFormat::GreptimedbV1,
-            $code,
-            $msg.to_string(),
-        ));
+        return HttpResponse::Error(ErrorResponse::from_error_message($code, $msg.to_string()));
     }};
 }
 
@@ -80,7 +77,7 @@ pub async fn scripts(
             unwrap_or_json_err!(String::from_utf8(bytes.to_vec()).context(InvalidUtf8ValueSnafu));
 
         // Safety: schema and name are already checked above.
-        let query_ctx = QueryContext::with(&catalog, schema.unwrap());
+        let query_ctx = Arc::new(QueryContext::with(&catalog, schema.unwrap()));
         match script_handler
             .insert_script(query_ctx, name.unwrap(), &script)
             .await
@@ -132,7 +129,7 @@ pub async fn run_script(
         }
 
         // Safety: schema and name are already checked above.
-        let query_ctx = QueryContext::with(&catalog, schema.unwrap());
+        let query_ctx = Arc::new(QueryContext::with(&catalog, schema.unwrap()));
         let output = script_handler
             .execute_script(query_ctx, name.unwrap(), params.params)
             .await;

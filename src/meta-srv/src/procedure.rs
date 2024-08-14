@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod region_failover;
 pub mod region_migration;
 #[cfg(test)]
 mod tests;

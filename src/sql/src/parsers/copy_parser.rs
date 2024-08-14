@@ -47,17 +47,23 @@ impl<'a> ParserContext<'a> {
     }
 
     fn parser_copy_database(&mut self) -> Result<CopyDatabase> {
-        let database_name =
-            self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a database name",
-                    actual: self.peek_token_as_string(),
-                })?;
+        let database_name = self
+            .parse_object_name()
+            .with_context(|_| error::UnexpectedSnafu {
+                sql: self.sql,
+                expected: "a database name",
+                actual: self.peek_token_as_string(),
+            })?;
 
         let req = if self.parser.parse_keyword(Keyword::TO) {
-            let (with, connection, location) = self.parse_copy_parameters()?;
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
+            if limit.is_some() {
+                return error::InvalidSqlSnafu {
+                    msg: "limit is not supported",
+                }
+                .fail();
+            }
+
             let argument = CopyDatabaseArgument {
                 database_name,
                 with: with.into(),
@@ -69,7 +75,14 @@ impl<'a> ParserContext<'a> {
             self.parser
                 .expect_keyword(Keyword::FROM)
                 .context(error::SyntaxSnafu)?;
-            let (with, connection, location) = self.parse_copy_parameters()?;
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
+            if limit.is_some() {
+                return error::InvalidSqlSnafu {
+                    msg: "limit is not supported",
+                }
+                .fail();
+            }
+
             let argument = CopyDatabaseArgument {
                 database_name,
                 with: with.into(),
@@ -82,39 +95,40 @@ impl<'a> ParserContext<'a> {
     }
 
     fn parse_copy_table(&mut self) -> Result<CopyTable> {
-        let raw_table_name =
-            self.parser
-                .parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a table name",
-                    actual: self.peek_token_as_string(),
-                })?;
+        let raw_table_name = self
+            .parse_object_name()
+            .with_context(|_| error::UnexpectedSnafu {
+                sql: self.sql,
+                expected: "a table name",
+                actual: self.peek_token_as_string(),
+            })?;
         let table_name = Self::canonicalize_object_name(raw_table_name);
 
         if self.parser.parse_keyword(Keyword::TO) {
-            let (with, connection, location) = self.parse_copy_parameters()?;
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
             Ok(CopyTable::To(CopyTableArgument {
                 table_name,
                 with: with.into(),
                 connection: connection.into(),
                 location,
+                limit,
             }))
         } else {
             self.parser
                 .expect_keyword(Keyword::FROM)
                 .context(error::SyntaxSnafu)?;
-            let (with, connection, location) = self.parse_copy_parameters()?;
+            let (with, connection, location, limit) = self.parse_copy_parameters()?;
             Ok(CopyTable::From(CopyTableArgument {
                 table_name,
                 with: with.into(),
                 connection: connection.into(),
                 location,
+                limit,
             }))
         }
     }
 
-    fn parse_copy_parameters(&mut self) -> Result<(With, Connection, String)> {
+    fn parse_copy_parameters(&mut self) -> Result<(With, Connection, String, Option<u64>)> {
         let location =
             self.parser
                 .parse_literal_string()
@@ -131,10 +145,8 @@ impl<'a> ParserContext<'a> {
 
         let with = options
             .into_iter()
-            .filter_map(|option| {
-                parse_option_string(option.value).map(|v| (option.name.value.to_lowercase(), v))
-            })
-            .collect();
+            .map(parse_option_string)
+            .collect::<Result<With>>()?;
 
         let connection_options = self
             .parser
@@ -143,12 +155,24 @@ impl<'a> ParserContext<'a> {
 
         let connection = connection_options
             .into_iter()
-            .filter_map(|option| {
-                parse_option_string(option.value).map(|v| (option.name.value.to_lowercase(), v))
-            })
-            .collect();
+            .map(parse_option_string)
+            .collect::<Result<Connection>>()?;
 
-        Ok((with, connection, location))
+        let limit = if self.parser.parse_keyword(Keyword::LIMIT) {
+            Some(
+                self.parser
+                    .parse_literal_uint()
+                    .with_context(|_| error::UnexpectedSnafu {
+                        sql: self.sql,
+                        expected: "the number of maximum rows",
+                        actual: self.peek_token_as_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        Ok((with, connection, location, limit))
     }
 }
 
@@ -384,20 +408,17 @@ mod tests {
             stmt.database_name
         );
         assert_eq!(
-            [("format".to_string(), "parquet".to_string())]
+            [("format", "parquet")]
                 .into_iter()
                 .collect::<HashMap<_, _>>(),
-            stmt.with.map
+            stmt.with.to_str_map()
         );
 
         assert_eq!(
-            [
-                ("foo".to_string(), "Bar".to_string()),
-                ("one".to_string(), "two".to_string())
-            ]
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-            stmt.connection.map
+            [("foo", "Bar"), ("one", "two")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.connection.to_str_map()
         );
     }
 
@@ -423,20 +444,17 @@ mod tests {
             stmt.database_name
         );
         assert_eq!(
-            [("format".to_string(), "parquet".to_string())]
+            [("format", "parquet")]
                 .into_iter()
                 .collect::<HashMap<_, _>>(),
-            stmt.with.map
+            stmt.with.to_str_map()
         );
 
         assert_eq!(
-            [
-                ("foo".to_string(), "Bar".to_string()),
-                ("one".to_string(), "two".to_string())
-            ]
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-            stmt.connection.map
+            [("foo", "Bar"), ("one", "two")]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            stmt.connection.to_str_map()
         );
     }
 }

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(never_type)]
+
 pub mod adapter;
 pub mod error;
 pub mod filter;
@@ -37,6 +39,10 @@ pub use recordbatch::RecordBatch;
 use snafu::{ensure, ResultExt};
 
 pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> {
+    fn name(&self) -> &str {
+        "RecordBatchStream"
+    }
+
     fn schema(&self) -> SchemaRef;
 
     fn output_ordering(&self) -> Option<&[OrderOption]>;
@@ -243,6 +249,10 @@ impl<S> RecordBatchStreamWrapper<S> {
 impl<S: Stream<Item = Result<RecordBatch>> + Unpin> RecordBatchStream
     for RecordBatchStreamWrapper<S>
 {
+    fn name(&self) -> &str {
+        "RecordBatchStreamWrapper"
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -252,7 +262,7 @@ impl<S: Stream<Item = Result<RecordBatch>> + Unpin> RecordBatchStream
     }
 
     fn metrics(&self) -> Option<RecordBatchMetrics> {
-        self.metrics.load().as_ref().map(|s| *s.as_ref())
+        self.metrics.load().as_ref().map(|s| s.as_ref().clone())
     }
 }
 

@@ -19,21 +19,25 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use api::v1::CreateTableExpr;
 use futures::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use table::metadata::TableId;
-use table::requests::CreateTableRequest;
 use table::TableRef;
 
 use crate::error::Result;
 
 pub mod error;
-pub mod information_schema;
 pub mod kvbackend;
 pub mod memory;
 mod metrics;
-pub mod table_source;
+pub mod system_schema;
+pub mod information_schema {
+    // TODO(j0hn50n133): re-export to make it compatible with the legacy code, migrate to the new path later
+    pub use crate::system_schema::information_schema::*;
+}
 
+pub mod table_source;
 #[async_trait::async_trait]
 pub trait CatalogManager: Send + Sync {
     fn as_any(&self) -> &dyn Any;
@@ -59,11 +63,7 @@ pub trait CatalogManager: Send + Sync {
     ) -> Result<Option<TableRef>>;
 
     /// Returns all tables with a stream by catalog and schema.
-    async fn tables<'a>(
-        &'a self,
-        catalog: &'a str,
-        schema: &'a str,
-    ) -> BoxStream<'a, Result<TableRef>>;
+    fn tables<'a>(&'a self, catalog: &'a str, schema: &'a str) -> BoxStream<'a, Result<TableRef>>;
 }
 
 pub type CatalogManagerRef = Arc<dyn CatalogManager>;
@@ -75,9 +75,9 @@ pub type OpenSystemTableHook =
 /// Register system table request:
 /// - When system table is already created and registered, the hook will be called
 ///     with table ref after opening the system table
-/// - When system table is not exists, create and register the table by create_table_request and calls open_hook with the created table.
+/// - When system table is not exists, create and register the table by `create_table_expr` and calls `open_hook` with the created table.
 pub struct RegisterSystemTableRequest {
-    pub create_table_request: CreateTableRequest,
+    pub create_table_expr: CreateTableExpr,
     pub open_hook: Option<OpenSystemTableHook>,
 }
 

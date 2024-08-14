@@ -12,26 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-
 use api::v1::meta::ProcedureStatus;
 use common_macro::admin_fn;
 use common_meta::rpc::procedure::ProcedureStateResponse;
-use common_query::error::Error::ThreadJoin;
 use common_query::error::{
     InvalidFuncArgsSnafu, MissingProcedureServiceHandlerSnafu, Result,
     UnsupportedInputDataTypeSnafu,
 };
 use common_query::prelude::{Signature, Volatility};
-use common_telemetry::error;
 use datatypes::prelude::*;
-use datatypes::vectors::VectorRef;
 use serde::Serialize;
 use session::context::QueryContextRef;
-use snafu::{ensure, Location, OptionExt};
+use snafu::ensure;
 
-use crate::ensure_greptime;
-use crate::function::{Function, FunctionContext};
 use crate::handlers::ProcedureServiceHandlerRef;
 
 #[derive(Serialize)]
@@ -44,10 +37,10 @@ struct ProcedureStateJson {
 /// A function to query procedure state by its id.
 /// Such as `procedure_state(pid)`.
 #[admin_fn(
-    name = "ProcedureStateFunction",
-    display_name = "procedure_state",
-    sig_fn = "signature",
-    ret = "string"
+    name = ProcedureStateFunction,
+    display_name = procedure_state,
+    sig_fn = signature,
+    ret = string
 )]
 pub(crate) async fn procedure_state(
     procedure_service_handler: &ProcedureServiceHandlerRef,
@@ -103,6 +96,7 @@ mod tests {
     use datatypes::vectors::StringVector;
 
     use super::*;
+    use crate::function::{Function, FunctionContext};
 
     #[test]
     fn test_procedure_state_misc() {

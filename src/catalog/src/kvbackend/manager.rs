@@ -15,40 +15,41 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use async_stream::try_stream;
 use common_catalog::consts::{
     DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, INFORMATION_SCHEMA_NAME, NUMBERS_TABLE_ID,
+    PG_CATALOG_NAME,
 };
-use common_catalog::format_full_table_name;
+use common_config::Mode;
 use common_error::ext::BoxedError;
-use common_meta::cache_invalidator::{CacheInvalidator, CacheInvalidatorRef, Context};
-use common_meta::error::Result as MetaResult;
+use common_meta::cache::{LayeredCacheRegistryRef, ViewInfoCacheRef};
 use common_meta::key::catalog_name::CatalogNameKey;
+use common_meta::key::flow::FlowMetadataManager;
 use common_meta::key::schema_name::SchemaNameKey;
 use common_meta::key::table_info::TableInfoValue;
 use common_meta::key::table_name::TableNameKey;
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::KvBackendRef;
-use common_meta::table_name::TableName;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
-use moka::future::{Cache as AsyncCache, CacheBuilder};
+use meta_client::client::MetaClient;
 use moka::sync::Cache;
 use partition::manager::{PartitionRuleManager, PartitionRuleManagerRef};
 use snafu::prelude::*;
 use table::dist_table::DistTable;
-use table::metadata::TableId;
 use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
+use table::table_name::TableName;
 use table::TableRef;
 
-use crate::error::Error::{GetTableCache, TableCacheNotGet};
 use crate::error::{
-    self as catalog_err, ListCatalogsSnafu, ListSchemasSnafu, ListTablesSnafu,
-    Result as CatalogResult, TableCacheNotGetSnafu, TableMetadataManagerSnafu,
+    CacheNotFoundSnafu, GetTableCacheSnafu, InvalidTableInfoInCatalogSnafu, ListCatalogsSnafu,
+    ListSchemasSnafu, ListTablesSnafu, Result, TableMetadataManagerSnafu,
 };
 use crate::information_schema::InformationSchemaProvider;
+use crate::kvbackend::TableCacheRef;
+use crate::system_schema::pg_catalog::PGCatalogProvider;
+use crate::system_schema::SystemSchemaProvider;
 use crate::CatalogManager;
 
 /// Access all existing catalog, schema and tables.
@@ -58,72 +59,67 @@ use crate::CatalogManager;
 /// comes from `SystemCatalog`, which is static and read-only.
 #[derive(Clone)]
 pub struct KvBackendCatalogManager {
-    // TODO(LFC): Maybe use a real implementation for Standalone mode.
-    // Now we use `NoopKvCacheInvalidator` for Standalone mode. In Standalone mode, the KV backend
-    // is implemented by RaftEngine. Maybe we need a cache for it?
-    cache_invalidator: CacheInvalidatorRef,
+    mode: Mode,
+    meta_client: Option<Arc<MetaClient>>,
     partition_manager: PartitionRuleManagerRef,
     table_metadata_manager: TableMetadataManagerRef,
     /// A sub-CatalogManager that handles system tables
     system_catalog: SystemCatalog,
-    table_cache: AsyncCache<String, TableRef>,
-}
-
-fn make_table(table_info_value: TableInfoValue) -> CatalogResult<TableRef> {
-    let table_info = table_info_value
-        .table_info
-        .try_into()
-        .context(catalog_err::InvalidTableInfoInCatalogSnafu)?;
-    Ok(DistTable::table(Arc::new(table_info)))
-}
-
-#[async_trait::async_trait]
-impl CacheInvalidator for KvBackendCatalogManager {
-    async fn invalidate_table_id(&self, ctx: &Context, table_id: TableId) -> MetaResult<()> {
-        self.cache_invalidator
-            .invalidate_table_id(ctx, table_id)
-            .await
-    }
-
-    async fn invalidate_table_name(&self, ctx: &Context, table_name: TableName) -> MetaResult<()> {
-        let table_cache_key = format_full_table_name(
-            &table_name.catalog_name,
-            &table_name.schema_name,
-            &table_name.table_name,
-        );
-        self.cache_invalidator
-            .invalidate_table_name(ctx, table_name)
-            .await?;
-        self.table_cache.invalidate(&table_cache_key).await;
-
-        Ok(())
-    }
+    cache_registry: LayeredCacheRegistryRef,
 }
 
 const CATALOG_CACHE_MAX_CAPACITY: u64 = 128;
-const TABLE_CACHE_MAX_CAPACITY: u64 = 65536;
-const TABLE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
-const TABLE_CACHE_TTI: Duration = Duration::from_secs(5 * 60);
 
 impl KvBackendCatalogManager {
-    pub fn new(backend: KvBackendRef, cache_invalidator: CacheInvalidatorRef) -> Arc<Self> {
+    pub fn new(
+        mode: Mode,
+        meta_client: Option<Arc<MetaClient>>,
+        backend: KvBackendRef,
+        cache_registry: LayeredCacheRegistryRef,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            partition_manager: Arc::new(PartitionRuleManager::new(backend.clone())),
-            table_metadata_manager: Arc::new(TableMetadataManager::new(backend)),
-            cache_invalidator,
+            mode,
+            meta_client,
+            partition_manager: Arc::new(PartitionRuleManager::new(
+                backend.clone(),
+                cache_registry
+                    .get()
+                    .expect("Failed to get table_route_cache"),
+            )),
+            table_metadata_manager: Arc::new(TableMetadataManager::new(backend.clone())),
             system_catalog: SystemCatalog {
                 catalog_manager: me.clone(),
                 catalog_cache: Cache::new(CATALOG_CACHE_MAX_CAPACITY),
+                pg_catalog_cache: Cache::new(CATALOG_CACHE_MAX_CAPACITY),
                 information_schema_provider: Arc::new(InformationSchemaProvider::new(
                     DEFAULT_CATALOG_NAME.to_string(),
                     me.clone(),
+                    Arc::new(FlowMetadataManager::new(backend.clone())),
                 )),
+                pg_catalog_provider: Arc::new(PGCatalogProvider::new(
+                    DEFAULT_CATALOG_NAME.to_string(),
+                    me.clone(),
+                )),
+                backend,
             },
-            table_cache: CacheBuilder::new(TABLE_CACHE_MAX_CAPACITY)
-                .time_to_live(TABLE_CACHE_TTL)
-                .time_to_idle(TABLE_CACHE_TTI)
-                .build(),
+            cache_registry,
         })
+    }
+
+    /// Returns the server running mode.
+    pub fn running_mode(&self) -> &Mode {
+        &self.mode
+    }
+
+    pub fn view_info_cache(&self) -> Result<ViewInfoCacheRef> {
+        self.cache_registry.get().context(CacheNotFoundSnafu {
+            name: "view_info_cache",
+        })
+    }
+
+    /// Returns the `[MetaClient]`.
+    pub fn meta_client(&self) -> Option<Arc<MetaClient>> {
+        self.meta_client.clone()
     }
 
     pub fn partition_manager(&self) -> PartitionRuleManagerRef {
@@ -141,12 +137,11 @@ impl CatalogManager for KvBackendCatalogManager {
         self
     }
 
-    async fn catalog_names(&self) -> CatalogResult<Vec<String>> {
+    async fn catalog_names(&self) -> Result<Vec<String>> {
         let stream = self
             .table_metadata_manager
             .catalog_manager()
-            .catalog_names()
-            .await;
+            .catalog_names();
 
         let keys = stream
             .try_collect::<Vec<_>>()
@@ -157,12 +152,11 @@ impl CatalogManager for KvBackendCatalogManager {
         Ok(keys)
     }
 
-    async fn schema_names(&self, catalog: &str) -> CatalogResult<Vec<String>> {
+    async fn schema_names(&self, catalog: &str) -> Result<Vec<String>> {
         let stream = self
             .table_metadata_manager
             .schema_manager()
-            .schema_names(catalog)
-            .await;
+            .schema_names(catalog);
         let mut keys = stream
             .try_collect::<BTreeSet<_>>()
             .await
@@ -174,12 +168,11 @@ impl CatalogManager for KvBackendCatalogManager {
         Ok(keys.into_iter().collect())
     }
 
-    async fn table_names(&self, catalog: &str, schema: &str) -> CatalogResult<Vec<String>> {
+    async fn table_names(&self, catalog: &str, schema: &str) -> Result<Vec<String>> {
         let stream = self
             .table_metadata_manager
             .table_name_manager()
-            .tables(catalog, schema)
-            .await;
+            .tables(catalog, schema);
         let mut tables = stream
             .try_collect::<Vec<_>>()
             .await
@@ -193,7 +186,7 @@ impl CatalogManager for KvBackendCatalogManager {
         Ok(tables.into_iter().collect())
     }
 
-    async fn catalog_exists(&self, catalog: &str) -> CatalogResult<bool> {
+    async fn catalog_exists(&self, catalog: &str) -> Result<bool> {
         self.table_metadata_manager
             .catalog_manager()
             .exists(CatalogNameKey::new(catalog))
@@ -201,8 +194,8 @@ impl CatalogManager for KvBackendCatalogManager {
             .context(TableMetadataManagerSnafu)
     }
 
-    async fn schema_exists(&self, catalog: &str, schema: &str) -> CatalogResult<bool> {
-        if self.system_catalog.schema_exist(schema) {
+    async fn schema_exists(&self, catalog: &str, schema: &str) -> Result<bool> {
+        if self.system_catalog.schema_exists(schema) {
             return Ok(true);
         }
 
@@ -213,8 +206,8 @@ impl CatalogManager for KvBackendCatalogManager {
             .context(TableMetadataManagerSnafu)
     }
 
-    async fn table_exists(&self, catalog: &str, schema: &str, table: &str) -> CatalogResult<bool> {
-        if self.system_catalog.table_exist(schema, table) {
+    async fn table_exists(&self, catalog: &str, schema: &str, table: &str) -> Result<bool> {
+        if self.system_catalog.table_exists(schema, table) {
             return Ok(true);
         }
 
@@ -229,67 +222,32 @@ impl CatalogManager for KvBackendCatalogManager {
 
     async fn table(
         &self,
-        catalog: &str,
-        schema: &str,
+        catalog_name: &str,
+        schema_name: &str,
         table_name: &str,
-    ) -> CatalogResult<Option<TableRef>> {
-        if let Some(table) = self.system_catalog.table(catalog, schema, table_name) {
+    ) -> Result<Option<TableRef>> {
+        if let Some(table) = self
+            .system_catalog
+            .table(catalog_name, schema_name, table_name)
+        {
             return Ok(Some(table));
         }
 
-        let init = async {
-            let table_name_key = TableNameKey::new(catalog, schema, table_name);
-            let Some(table_name_value) = self
-                .table_metadata_manager
-                .table_name_manager()
-                .get(table_name_key)
-                .await
-                .context(TableMetadataManagerSnafu)?
-            else {
-                return TableCacheNotGetSnafu {
-                    key: table_name_key.to_string(),
-                }
-                .fail();
-            };
-            let table_id = table_name_value.table_id();
+        let table_cache: TableCacheRef = self.cache_registry.get().context(CacheNotFoundSnafu {
+            name: "table_cache",
+        })?;
 
-            let Some(table_info_value) = self
-                .table_metadata_manager
-                .table_info_manager()
-                .get(table_id)
-                .await
-                .context(TableMetadataManagerSnafu)?
-                .map(|v| v.into_inner())
-            else {
-                return TableCacheNotGetSnafu {
-                    key: table_name_key.to_string(),
-                }
-                .fail();
-            };
-            make_table(table_info_value)
-        };
-
-        match self
-            .table_cache
-            .try_get_with_by_ref(&format_full_table_name(catalog, schema, table_name), init)
+        table_cache
+            .get_by_ref(&TableName {
+                catalog_name: catalog_name.to_string(),
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+            })
             .await
-        {
-            Ok(table) => Ok(Some(table)),
-            Err(err) => match err.as_ref() {
-                TableCacheNotGet { .. } => Ok(None),
-                _ => Err(err),
-            },
-        }
-        .map_err(|err| GetTableCache {
-            err_msg: err.to_string(),
-        })
+            .context(GetTableCacheSnafu)
     }
 
-    async fn tables<'a>(
-        &'a self,
-        catalog: &'a str,
-        schema: &'a str,
-    ) -> BoxStream<'a, CatalogResult<TableRef>> {
+    fn tables<'a>(&'a self, catalog: &'a str, schema: &'a str) -> BoxStream<'a, Result<TableRef>> {
         let sys_tables = try_stream!({
             // System tables
             let sys_table_names = self.system_catalog.table_names(schema);
@@ -304,7 +262,6 @@ impl CatalogManager for KvBackendCatalogManager {
             .table_metadata_manager
             .table_name_manager()
             .tables(catalog, schema)
-            .await
             .map_ok(|(_, v)| v.table_id());
         const BATCH_SIZE: usize = 128;
         let user_tables = try_stream!({
@@ -314,7 +271,7 @@ impl CatalogManager for KvBackendCatalogManager {
             while let Some(table_ids) = table_id_chunks.next().await {
                 let table_ids = table_ids
                     .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
+                    .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(BoxedError::new)
                     .context(ListTablesSnafu { catalog, schema })?;
 
@@ -326,7 +283,7 @@ impl CatalogManager for KvBackendCatalogManager {
                     .context(TableMetadataManagerSnafu)?;
 
                 for table_info_value in table_info_values.into_values() {
-                    yield make_table(table_info_value)?;
+                    yield build_table(table_info_value)?;
                 }
             }
         });
@@ -335,43 +292,64 @@ impl CatalogManager for KvBackendCatalogManager {
     }
 }
 
+fn build_table(table_info_value: TableInfoValue) -> Result<TableRef> {
+    let table_info = table_info_value
+        .table_info
+        .try_into()
+        .context(InvalidTableInfoInCatalogSnafu)?;
+    Ok(DistTable::table(Arc::new(table_info)))
+}
+
 // TODO: This struct can hold a static map of all system tables when
 // the upper layer (e.g., procedure) can inform the catalog manager
 // a new catalog is created.
 /// Existing system tables:
 /// - public.numbers
 /// - information_schema.{tables}
+/// - pg_catalog.{tables}
 #[derive(Clone)]
 struct SystemCatalog {
     catalog_manager: Weak<KvBackendCatalogManager>,
     catalog_cache: Cache<String, Arc<InformationSchemaProvider>>,
+    pg_catalog_cache: Cache<String, Arc<PGCatalogProvider>>,
+
+    // system_schema_provier for default catalog
     information_schema_provider: Arc<InformationSchemaProvider>,
+    pg_catalog_provider: Arc<PGCatalogProvider>,
+    backend: KvBackendRef,
 }
 
 impl SystemCatalog {
+    // TODO(j0hn50n133): remove the duplicated hard-coded table names logic
     fn schema_names(&self) -> Vec<String> {
-        vec![INFORMATION_SCHEMA_NAME.to_string()]
+        vec![
+            INFORMATION_SCHEMA_NAME.to_string(),
+            PG_CATALOG_NAME.to_string(),
+        ]
     }
 
     fn table_names(&self, schema: &str) -> Vec<String> {
-        if schema == INFORMATION_SCHEMA_NAME {
-            self.information_schema_provider.table_names()
-        } else if schema == DEFAULT_SCHEMA_NAME {
-            vec![NUMBERS_TABLE_NAME.to_string()]
-        } else {
-            vec![]
+        match schema {
+            INFORMATION_SCHEMA_NAME => self.information_schema_provider.table_names(),
+            PG_CATALOG_NAME => self.pg_catalog_provider.table_names(),
+            DEFAULT_SCHEMA_NAME => {
+                vec![NUMBERS_TABLE_NAME.to_string()]
+            }
+            _ => vec![],
         }
     }
 
-    fn schema_exist(&self, schema: &str) -> bool {
-        schema == INFORMATION_SCHEMA_NAME
+    fn schema_exists(&self, schema: &str) -> bool {
+        schema == INFORMATION_SCHEMA_NAME || schema == PG_CATALOG_NAME
     }
 
-    fn table_exist(&self, schema: &str, table: &str) -> bool {
+    fn table_exists(&self, schema: &str, table: &str) -> bool {
         if schema == INFORMATION_SCHEMA_NAME {
             self.information_schema_provider.table(table).is_some()
         } else if schema == DEFAULT_SCHEMA_NAME {
             table == NUMBERS_TABLE_NAME
+        } else if schema == PG_CATALOG_NAME {
+            self.pg_catalog_provider.table(table).is_some()
         } else {
             false
         }
@@ -384,9 +362,23 @@ impl SystemCatalog {
                     Arc::new(InformationSchemaProvider::new(
                         catalog.to_string(),
                         self.catalog_manager.clone(),
+                        Arc::new(FlowMetadataManager::new(self.backend.clone())),
                     ))
                 });
             information_schema_provider.table(table_name)
+        } else if schema == PG_CATALOG_NAME {
+            if catalog == DEFAULT_CATALOG_NAME {
+                self.pg_catalog_provider.table(table_name)
+            } else {
+                let pg_catalog_provider =
+                    self.pg_catalog_cache.get_with_by_ref(catalog, move || {
+                        Arc::new(PGCatalogProvider::new(
+                            catalog.to_string(),
+                            self.catalog_manager.clone(),
+                        ))
+                    });
+                pg_catalog_provider.table(table_name)
+            }
         } else if schema == DEFAULT_SCHEMA_NAME && table_name == NUMBERS_TABLE_NAME {
             Some(NumbersTable::table(NUMBERS_TABLE_ID))
         } else {

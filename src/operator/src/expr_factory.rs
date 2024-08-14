@@ -12,17 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use api::helper::ColumnDataTypeWrapper;
 use api::v1::alter_expr::Kind;
+use api::v1::column_def::options_from_column_schema;
 use api::v1::{
-    AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, ColumnDataTypeExtension,
-    CreateTableExpr, DropColumn, DropColumns, RenameTable, SemanticType,
+    AddColumn, AddColumns, AlterExpr, ChangeColumnType, ChangeColumnTypes, ColumnDataType,
+    ColumnDataTypeExtension, CreateFlowExpr, CreateTableExpr, CreateViewExpr, DropColumn,
+    DropColumns, ExpireAfter, RenameTable, SemanticType, TableName,
 };
 use common_error::ext::BoxedError;
 use common_grpc_expr::util::ColumnExpr;
 use common_time::Timezone;
+use datafusion::sql::planner::object_name_to_table_reference;
 use datatypes::schema::{ColumnSchema, COMMENT_KEY};
 use file_engine::FileOptions;
 use query::sql::{
@@ -31,45 +34,30 @@ use query::sql::{
 };
 use session::context::QueryContextRef;
 use session::table_name::table_idents_to_full_name;
-use snafu::{ensure, ResultExt};
-use sql::ast::{ColumnDef, ColumnOption, TableConstraint};
+use snafu::{ensure, OptionExt, ResultExt};
+use sql::ast::{ColumnOption, TableConstraint};
 use sql::statements::alter::{AlterTable, AlterTableOperation};
-use sql::statements::create::{CreateExternalTable, CreateTable, TIME_INDEX};
-use sql::statements::{column_def_to_schema, sql_column_def_to_grpc_column_def};
-use sql::util::to_lowercase_options_map;
+use sql::statements::create::{
+    Column as SqlColumn, CreateExternalTable, CreateFlow, CreateTable, CreateView, TIME_INDEX,
+};
+use sql::statements::{
+    column_to_schema, sql_column_def_to_grpc_column_def, sql_data_type_to_concrete_data_type,
+};
+use sql::util::extract_tables_from_query;
 use table::requests::{TableOptions, FILE_TABLE_META_KEY};
 use table::table_reference::TableReference;
 
 use crate::error::{
     BuildCreateExprOnInsertionSnafu, ColumnDataTypeSnafu, ConvertColumnDefaultConstraintSnafu,
-    EncodeJsonSnafu, ExternalSnafu, IllegalPrimaryKeysDefSnafu, InferFileTableSchemaSnafu,
-    InvalidSqlSnafu, NotSupportedSnafu, ParseSqlSnafu, PrepareFileTableSnafu, Result,
-    SchemaIncompatibleSnafu, UnrecognizedTableOptionSnafu,
+    ConvertIdentifierSnafu, EncodeJsonSnafu, ExternalSnafu, IllegalPrimaryKeysDefSnafu,
+    InferFileTableSchemaSnafu, InvalidSqlSnafu, NotSupportedSnafu, ParseSqlSnafu,
+    PrepareFileTableSnafu, Result, SchemaIncompatibleSnafu, UnrecognizedTableOptionSnafu,
 };
 
 #[derive(Debug, Copy, Clone)]
 pub struct CreateExprFactory;
 
 impl CreateExprFactory {
-    pub fn create_table_expr_by_columns(
-        &self,
-        table_name: &TableReference<'_>,
-        columns: &[Column],
-        engine: &str,
-    ) -> Result<CreateTableExpr> {
-        let column_exprs = ColumnExpr::from_columns(columns);
-        let create_expr = common_grpc_expr::util::build_create_table_expr(
-            None,
-            table_name,
-            column_exprs,
-            engine,
-            "Created on insertion",
-        )
-        .context(BuildCreateExprOnInsertionSnafu)?;
-
-        Ok(create_expr)
-    }
-
     pub fn create_table_expr_by_column_schemas(
         &self,
         table_name: &TableReference<'_>,
@@ -120,20 +108,20 @@ impl CreateExprFactory {
 //    constraint.
 pub(crate) async fn create_external_expr(
     create: CreateExternalTable,
-    query_ctx: QueryContextRef,
+    query_ctx: &QueryContextRef,
 ) -> Result<CreateTableExpr> {
     let (catalog_name, schema_name, table_name) =
-        table_idents_to_full_name(&create.name, &query_ctx)
+        table_idents_to_full_name(&create.name, query_ctx)
             .map_err(BoxedError::new)
             .context(ExternalSnafu)?;
 
-    let mut table_options = create.options;
+    let mut table_options = create.options.into_map();
 
-    let (object_store, files) = prepare_file_table_files(&table_options.map)
+    let (object_store, files) = prepare_file_table_files(&table_options)
         .await
         .context(PrepareFileTableSnafu)?;
 
-    let file_column_schemas = infer_file_table_schema(&object_store, &files, &table_options.map)
+    let file_column_schemas = infer_file_table_schema(&object_store, &files, &table_options)
         .await
         .context(InferFileTableSchemaSnafu)?
         .column_schemas;
@@ -174,7 +162,7 @@ pub(crate) async fn create_external_expr(
         time_index,
         primary_keys,
         create_if_not_exists: create.if_not_exists,
-        table_options: table_options.map,
+        table_options,
         table_id: None,
         engine: create.engine.to_string(),
     };
@@ -182,15 +170,18 @@ pub(crate) async fn create_external_expr(
 }
 
 /// Convert `CreateTable` statement to [`CreateTableExpr`] gRPC request.
-pub fn create_to_expr(create: &CreateTable, query_ctx: QueryContextRef) -> Result<CreateTableExpr> {
+pub fn create_to_expr(
+    create: &CreateTable,
+    query_ctx: &QueryContextRef,
+) -> Result<CreateTableExpr> {
     let (catalog_name, schema_name, table_name) =
-        table_idents_to_full_name(&create.name, &query_ctx)
+        table_idents_to_full_name(&create.name, query_ctx)
             .map_err(BoxedError::new)
             .context(ExternalSnafu)?;
 
     let time_index = find_time_index(&create.constraints)?;
     let table_options = HashMap::from(
-        &TableOptions::try_from(&to_lowercase_options_map(&create.options))
+        &TableOptions::try_from_iter(create.options.to_str_map())
             .context(UnrecognizedTableOptionSnafu)?,
     );
 
@@ -214,21 +205,89 @@ pub fn create_to_expr(create: &CreateTable, query_ctx: QueryContextRef) -> Resul
         table_id: None,
         engine: create.engine.to_string(),
     };
+
+    validate_create_expr(&expr)?;
     Ok(expr)
 }
 
+/// Validate the [`CreateTableExpr`] request.
+pub fn validate_create_expr(create: &CreateTableExpr) -> Result<()> {
+    // construct column list
+    let mut column_to_indices = HashMap::with_capacity(create.column_defs.len());
+    for (idx, column) in create.column_defs.iter().enumerate() {
+        if let Some(indices) = column_to_indices.get(&column.name) {
+            return InvalidSqlSnafu {
+                err_msg: format!(
+                    "column name `{}` is duplicated at index {} and {}",
+                    column.name, indices, idx
+                ),
+            }
+            .fail();
+        }
+        column_to_indices.insert(&column.name, idx);
+    }
+
+    // verify time_index exists
+    let _ = column_to_indices
+        .get(&create.time_index)
+        .with_context(|| InvalidSqlSnafu {
+            err_msg: format!(
+                "column name `{}` is not found in column list",
+                create.time_index
+            ),
+        })?;
+
+    // verify primary_key exists
+    for pk in &create.primary_keys {
+        let _ = column_to_indices
+            .get(&pk)
+            .with_context(|| InvalidSqlSnafu {
+                err_msg: format!("column name `{}` is not found in column list", pk),
+            })?;
+    }
+
+    // construct primary_key set
+    let mut pk_set = HashSet::new();
+    for pk in &create.primary_keys {
+        if !pk_set.insert(pk) {
+            return InvalidSqlSnafu {
+                err_msg: format!("column name `{}` is duplicated in primary keys", pk),
+            }
+            .fail();
+        }
+    }
+
+    // verify time index is not primary key
+    if pk_set.contains(&create.time_index) {
+        return InvalidSqlSnafu {
+            err_msg: format!(
+                "column name `{}` is both primary key and time index",
+                create.time_index
+            ),
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
 fn find_primary_keys(
-    columns: &[ColumnDef],
+    columns: &[SqlColumn],
     constraints: &[TableConstraint],
 ) -> Result<Vec<String>> {
     let columns_pk = columns
         .iter()
         .filter_map(|x| {
-            if x.options
-                .iter()
-                .any(|o| matches!(o.option, ColumnOption::Unique { is_primary: true }))
-            {
-                Some(x.name.value.clone())
+            if x.options().iter().any(|o| {
+                matches!(
+                    o.option,
+                    ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
+                )
+            }) {
+                Some(x.name().value.clone())
             } else {
                 None
             }
@@ -245,10 +304,8 @@ fn find_primary_keys(
     let constraints_pk = constraints
         .iter()
         .filter_map(|constraint| match constraint {
-            TableConstraint::Unique {
-                name: _,
-                columns,
-                is_primary: true,
+            TableConstraint::PrimaryKey {
+                name: _, columns, ..
             } => Some(columns.iter().map(|ident| ident.value.clone())),
             _ => None,
         })
@@ -275,7 +332,7 @@ pub fn find_time_index(constraints: &[TableConstraint]) -> Result<String> {
             TableConstraint::Unique {
                 name: Some(name),
                 columns,
-                is_primary: false,
+                ..
             } => {
                 if name.value == TIME_INDEX {
                     Some(columns.iter().map(|ident| &ident.value))
@@ -297,7 +354,7 @@ pub fn find_time_index(constraints: &[TableConstraint]) -> Result<String> {
 }
 
 fn columns_to_expr(
-    column_defs: &[ColumnDef],
+    column_defs: &[SqlColumn],
     time_index: &str,
     primary_keys: &[String],
     timezone: Option<&Timezone>,
@@ -307,15 +364,14 @@ fn columns_to_expr(
 }
 
 fn columns_to_column_schemas(
-    column_defs: &[ColumnDef],
+    columns: &[SqlColumn],
     time_index: &str,
     timezone: Option<&Timezone>,
 ) -> Result<Vec<ColumnSchema>> {
-    column_defs
+    columns
         .iter()
         .map(|c| {
-            column_def_to_schema(c, c.name.to_string() == time_index, timezone)
-                .context(ParseSqlSnafu)
+            column_to_schema(c, c.name().to_string() == time_index, timezone).context(ParseSqlSnafu)
         })
         .collect::<Result<Vec<ColumnSchema>>>()
 }
@@ -367,6 +423,7 @@ pub fn column_schemas_to_defs(
                 semantic_type,
                 comment,
                 datatype_extension: datatype.1,
+                options: options_from_column_schema(schema),
             })
         })
         .collect()
@@ -374,10 +431,10 @@ pub fn column_schemas_to_defs(
 
 pub(crate) fn to_alter_expr(
     alter_table: AlterTable,
-    query_ctx: QueryContextRef,
+    query_ctx: &QueryContextRef,
 ) -> Result<AlterExpr> {
     let (catalog_name, schema_name, table_name) =
-        table_idents_to_full_name(alter_table.table_name(), &query_ctx)
+        table_idents_to_full_name(alter_table.table_name(), query_ctx)
             .map_err(BoxedError::new)
             .context(ExternalSnafu)?;
 
@@ -401,6 +458,23 @@ pub(crate) fn to_alter_expr(
                 location: location.as_ref().map(From::from),
             }],
         }),
+        AlterTableOperation::ChangeColumnType {
+            column_name,
+            target_type,
+        } => {
+            let target_type =
+                sql_data_type_to_concrete_data_type(target_type).context(ParseSqlSnafu)?;
+            let (target_type, target_type_extension) = ColumnDataTypeWrapper::try_from(target_type)
+                .map(|w| w.to_parts())
+                .context(ColumnDataTypeSnafu)?;
+            Kind::ChangeColumnTypes(ChangeColumnTypes {
+                change_column_types: vec![ChangeColumnType {
+                    column_name: column_name.value.to_string(),
+                    target_type: target_type as i32,
+                    target_type_extension,
+                }],
+            })
+        }
         AlterTableOperation::DropColumn { name } => Kind::DropColumns(DropColumns {
             drop_columns: vec![DropColumn {
                 name: name.value.to_string(),
@@ -419,6 +493,99 @@ pub(crate) fn to_alter_expr(
     })
 }
 
+/// Try to cast the `[CreateViewExpr]` statement into gRPC `[CreateViewExpr]`.
+pub fn to_create_view_expr(
+    stmt: CreateView,
+    logical_plan: Vec<u8>,
+    table_names: Vec<TableName>,
+    columns: Vec<String>,
+    plan_columns: Vec<String>,
+    definition: String,
+    query_ctx: QueryContextRef,
+) -> Result<CreateViewExpr> {
+    let (catalog_name, schema_name, view_name) = table_idents_to_full_name(&stmt.name, &query_ctx)
+        .map_err(BoxedError::new)
+        .context(ExternalSnafu)?;
+
+    let expr = CreateViewExpr {
+        catalog_name,
+        schema_name,
+        view_name,
+        logical_plan,
+        create_if_not_exists: stmt.if_not_exists,
+        or_replace: stmt.or_replace,
+        table_names,
+        columns,
+        plan_columns,
+        definition,
+    };
+
+    Ok(expr)
+}
+
+pub fn to_create_flow_task_expr(
+    create_flow: CreateFlow,
+    query_ctx: &QueryContextRef,
+) -> Result<CreateFlowExpr> {
+    // retrieve sink table name
+    let sink_table_ref =
+        object_name_to_table_reference(create_flow.sink_table_name.clone().into(), true)
+            .with_context(|_| ConvertIdentifierSnafu {
+                ident: create_flow.sink_table_name.to_string(),
+            })?;
+    let catalog = sink_table_ref
+        .catalog()
+        .unwrap_or(query_ctx.current_catalog())
+        .to_string();
+    let schema = sink_table_ref
+        .schema()
+        .map(|s| s.to_owned())
+        .unwrap_or(query_ctx.current_schema());
+
+    let sink_table_name = TableName {
+        catalog_name: catalog,
+        schema_name: schema,
+        table_name: sink_table_ref.table().to_string(),
+    };
+
+    let source_table_names = extract_tables_from_query(&create_flow.query)
+        .map(|name| {
+            let reference = object_name_to_table_reference(name.clone().into(), true)
+                .with_context(|_| ConvertIdentifierSnafu {
+                    ident: name.to_string(),
+                })?;
+            let catalog = reference
+                .catalog()
+                .unwrap_or(query_ctx.current_catalog())
+                .to_string();
+            let schema = reference
+                .schema()
+                .map(|s| s.to_string())
+                .unwrap_or(query_ctx.current_schema());
+
+            let table_name = TableName {
+                catalog_name: catalog,
+                schema_name: schema,
+                table_name: reference.table().to_string(),
+            };
+            Ok(table_name)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(CreateFlowExpr {
+        catalog_name: query_ctx.current_catalog().to_string(),
+        flow_name: create_flow.flow_name.to_string(),
+        source_table_names,
+        sink_table_name: Some(sink_table_name),
+        or_replace: create_flow.or_replace,
+        create_if_not_exists: create_flow.if_not_exists,
+        expire_after: create_flow.expire_after.map(|value| ExpireAfter { value }),
+        comment: create_flow.comment.unwrap_or_default(),
+        sql: create_flow.query.to_string(),
+        flow_options: HashMap::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use datatypes::value::Value;
@@ -432,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_create_to_expr() {
-        let sql = "CREATE TABLE monitor (host STRING,ts TIMESTAMP,TIME INDEX (ts),PRIMARY KEY(host)) ENGINE=mito WITH(regions=1, ttl='3days', write_buffer_size='1024KB');";
+        let sql = "CREATE TABLE monitor (host STRING,ts TIMESTAMP,TIME INDEX (ts),PRIMARY KEY(host)) ENGINE=mito WITH(ttl='3days', write_buffer_size='1024KB');";
         let stmt =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
                 .unwrap()
@@ -442,12 +609,39 @@ mod tests {
         let Statement::CreateTable(create_table) = stmt else {
             unreachable!()
         };
-        let expr = create_to_expr(&create_table, QueryContext::arc()).unwrap();
+        let expr = create_to_expr(&create_table, &QueryContext::arc()).unwrap();
         assert_eq!("3days", expr.table_options.get("ttl").unwrap());
         assert_eq!(
             "1.0MiB",
             expr.table_options.get("write_buffer_size").unwrap()
         );
+    }
+
+    #[test]
+    fn test_invalid_create_to_expr() {
+        let cases = [
+            // duplicate column declaration
+            "CREATE TABLE monitor (host STRING primary key, ts TIMESTAMP TIME INDEX, some_column text, some_column string);",
+            // duplicate primary key
+            "CREATE TABLE monitor (host STRING, ts TIMESTAMP TIME INDEX, some_column STRING, PRIMARY KEY (some_column, host, some_column));",
+            // time index is primary key
+            "CREATE TABLE monitor (host STRING, ts TIMESTAMP TIME INDEX, PRIMARY KEY (host, ts));"
+        ];
+
+        for sql in cases {
+            let stmt = ParserContext::create_with_dialect(
+                sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            let Statement::CreateTable(create_table) = stmt else {
+                unreachable!()
+            };
+            create_to_expr(&create_table, &QueryContext::arc()).unwrap_err();
+        }
     }
 
     #[test]
@@ -464,7 +658,7 @@ mod tests {
         };
 
         // query context with system timezone UTC.
-        let expr = create_to_expr(&create_table, QueryContext::arc()).unwrap();
+        let expr = create_to_expr(&create_table, &QueryContext::arc()).unwrap();
         let ts_column = &expr.column_defs[1];
         let constraint = assert_ts_column(ts_column);
         assert!(
@@ -474,9 +668,10 @@ mod tests {
 
         // query context with timezone `+08:00`
         let ctx = QueryContextBuilder::default()
-            .timezone(Timezone::from_tz_string("+08:00").unwrap().into())
-            .build();
-        let expr = create_to_expr(&create_table, ctx).unwrap();
+            .timezone(Timezone::from_tz_string("+08:00").unwrap())
+            .build()
+            .into();
+        let expr = create_to_expr(&create_table, &ctx).unwrap();
         let ts_column = &expr.column_defs[1];
         let constraint = assert_ts_column(ts_column);
         assert!(
@@ -510,7 +705,7 @@ mod tests {
         };
 
         // query context with system timezone UTC.
-        let expr = to_alter_expr(alter_table.clone(), QueryContext::arc()).unwrap();
+        let expr = to_alter_expr(alter_table.clone(), &QueryContext::arc()).unwrap();
         let kind = expr.kind.unwrap();
 
         let Kind::AddColumns(AddColumns { add_columns, .. }) = kind else {
@@ -528,9 +723,10 @@ mod tests {
         //
         // query context with timezone `+08:00`
         let ctx = QueryContextBuilder::default()
-            .timezone(Timezone::from_tz_string("+08:00").unwrap().into())
-            .build();
-        let expr = to_alter_expr(alter_table, ctx).unwrap();
+            .timezone(Timezone::from_tz_string("+08:00").unwrap())
+            .build()
+            .into();
+        let expr = to_alter_expr(alter_table, &ctx).unwrap();
         let kind = expr.kind.unwrap();
 
         let Kind::AddColumns(AddColumns { add_columns, .. }) = kind else {
@@ -544,5 +740,137 @@ mod tests {
             matches!(constraint, ColumnDefaultConstraint::Value(Value::Timestamp(ts))
                          if ts.to_iso8601_string() == "2024-01-29 16:01:01+0000")
         );
+    }
+
+    #[test]
+    fn test_to_alter_change_column_type_expr() {
+        let sql = "ALTER TABLE monitor MODIFY mem_usage STRING;";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::Alter(alter_table) = stmt else {
+            unreachable!()
+        };
+
+        // query context with system timezone UTC.
+        let expr = to_alter_expr(alter_table.clone(), &QueryContext::arc()).unwrap();
+        let kind = expr.kind.unwrap();
+
+        let Kind::ChangeColumnTypes(ChangeColumnTypes {
+            change_column_types,
+        }) = kind
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(1, change_column_types.len());
+        let change_column_type = &change_column_types[0];
+
+        assert_eq!("mem_usage", change_column_type.column_name);
+        assert_eq!(
+            ColumnDataType::String as i32,
+            change_column_type.target_type
+        );
+        assert!(change_column_type.target_type_extension.is_none());
+    }
+
+    fn new_test_table_names() -> Vec<TableName> {
+        vec![
+            TableName {
+                catalog_name: "greptime".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "a_table".to_string(),
+            },
+            TableName {
+                catalog_name: "greptime".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "b_table".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_to_create_view_expr() {
+        let sql = "CREATE VIEW test AS SELECT * FROM NUMBERS";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateView(stmt) = stmt else {
+            unreachable!()
+        };
+
+        let logical_plan = vec![1, 2, 3];
+        let table_names = new_test_table_names();
+        let columns = vec!["a".to_string()];
+        let plan_columns = vec!["number".to_string()];
+
+        let expr = to_create_view_expr(
+            stmt,
+            logical_plan.clone(),
+            table_names.clone(),
+            columns.clone(),
+            plan_columns.clone(),
+            sql.to_string(),
+            QueryContext::arc(),
+        )
+        .unwrap();
+
+        assert_eq!("greptime", expr.catalog_name);
+        assert_eq!("public", expr.schema_name);
+        assert_eq!("test", expr.view_name);
+        assert!(!expr.create_if_not_exists);
+        assert!(!expr.or_replace);
+        assert_eq!(logical_plan, expr.logical_plan);
+        assert_eq!(table_names, expr.table_names);
+        assert_eq!(sql, expr.definition);
+        assert_eq!(columns, expr.columns);
+        assert_eq!(plan_columns, expr.plan_columns);
+    }
+
+    #[test]
+    fn test_to_create_view_expr_complex() {
+        let sql = "CREATE OR REPLACE VIEW IF NOT EXISTS test.test_view AS SELECT * FROM NUMBERS";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateView(stmt) = stmt else {
+            unreachable!()
+        };
+
+        let logical_plan = vec![1, 2, 3];
+        let table_names = new_test_table_names();
+        let columns = vec!["a".to_string()];
+        let plan_columns = vec!["number".to_string()];
+
+        let expr = to_create_view_expr(
+            stmt,
+            logical_plan.clone(),
+            table_names.clone(),
+            columns.clone(),
+            plan_columns.clone(),
+            sql.to_string(),
+            QueryContext::arc(),
+        )
+        .unwrap();
+
+        assert_eq!("greptime", expr.catalog_name);
+        assert_eq!("test", expr.schema_name);
+        assert_eq!("test_view", expr.view_name);
+        assert!(expr.create_if_not_exists);
+        assert!(expr.or_replace);
+        assert_eq!(logical_plan, expr.logical_plan);
+        assert_eq!(table_names, expr.table_names);
+        assert_eq!(sql, expr.definition);
+        assert_eq!(columns, expr.columns);
+        assert_eq!(plan_columns, expr.plan_columns);
     }
 }

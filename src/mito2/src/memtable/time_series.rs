@@ -36,15 +36,20 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
-use crate::error::{ComputeArrowSnafu, ConvertVectorSnafu, PrimaryKeyLengthMismatchSnafu, Result};
+use crate::error::{
+    ComputeArrowSnafu, ConvertVectorSnafu, PrimaryKeyLengthMismatchSnafu, Result,
+    UnsupportedOperationSnafu,
+};
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::key_values::KeyValue;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, KeyValues, Memtable, MemtableBuilder, MemtableId,
-    MemtableRef, MemtableStats,
+    AllocTracker, BoxedBatchIterator, BulkPart, IterBuilder, KeyValues, Memtable, MemtableBuilder,
+    MemtableId, MemtableRange, MemtableRangeContext, MemtableRef, MemtableStats,
 };
 use crate::metrics::{READ_ROWS_TOTAL, READ_STAGE_ELAPSED};
+use crate::read::dedup::LastNonNullIter;
 use crate::read::{Batch, BatchBuilder, BatchColumn};
+use crate::region::options::MergeMode;
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 
 /// Initial vector builder capacity.
@@ -54,13 +59,21 @@ const INITIAL_BUILDER_CAPACITY: usize = 0;
 #[derive(Debug, Default)]
 pub struct TimeSeriesMemtableBuilder {
     write_buffer_manager: Option<WriteBufferManagerRef>,
+    dedup: bool,
+    merge_mode: MergeMode,
 }
 
 impl TimeSeriesMemtableBuilder {
     /// Creates a new builder with specific `write_buffer_manager`.
-    pub fn new(write_buffer_manager: Option<WriteBufferManagerRef>) -> Self {
+    pub fn new(
+        write_buffer_manager: Option<WriteBufferManagerRef>,
+        dedup: bool,
+        merge_mode: MergeMode,
+    ) -> Self {
         Self {
             write_buffer_manager,
+            dedup,
+            merge_mode,
         }
     }
 }
@@ -71,6 +84,8 @@ impl MemtableBuilder for TimeSeriesMemtableBuilder {
             metadata.clone(),
             id,
             self.write_buffer_manager.clone(),
+            self.dedup,
+            self.merge_mode,
         ))
     }
 }
@@ -84,6 +99,8 @@ pub struct TimeSeriesMemtable {
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
     min_timestamp: AtomicI64,
+    dedup: bool,
+    merge_mode: MergeMode,
 }
 
 impl TimeSeriesMemtable {
@@ -91,6 +108,8 @@ impl TimeSeriesMemtable {
         region_metadata: RegionMetadataRef,
         id: MemtableId,
         write_buffer_manager: Option<WriteBufferManagerRef>,
+        dedup: bool,
+        merge_mode: MergeMode,
     ) -> Self {
         let row_codec = Arc::new(McmpRowCodec::new(
             region_metadata
@@ -99,6 +118,11 @@ impl TimeSeriesMemtable {
                 .collect(),
         ));
         let series_set = SeriesSet::new(region_metadata.clone(), row_codec.clone());
+        let dedup = if merge_mode == MergeMode::LastNonNull {
+            false
+        } else {
+            dedup
+        };
         Self {
             id,
             region_metadata,
@@ -107,6 +131,8 @@ impl TimeSeriesMemtable {
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
             min_timestamp: AtomicI64::new(i64::MAX),
+            dedup,
+            merge_mode,
         }
     }
 
@@ -218,6 +244,13 @@ impl Memtable for TimeSeriesMemtable {
         res
     }
 
+    fn write_bulk(&self, _part: BulkPart) -> Result<()> {
+        UnsupportedOperationSnafu {
+            err_msg: "TimeSeriesMemtable does not support write_bulk",
+        }
+        .fail()
+    }
+
     fn iter(
         &self,
         projection: Option<&[ColumnId]>,
@@ -232,8 +265,41 @@ impl Memtable for TimeSeriesMemtable {
                 .collect()
         };
 
-        let iter = self.series_set.iter_series(projection, filters);
-        Ok(Box::new(iter))
+        let iter = self
+            .series_set
+            .iter_series(projection, filters, self.dedup)?;
+
+        if self.merge_mode == MergeMode::LastNonNull {
+            let iter = LastNonNullIter::new(iter);
+            Ok(Box::new(iter))
+        } else {
+            Ok(Box::new(iter))
+        }
+    }
+
+    fn ranges(
+        &self,
+        projection: Option<&[ColumnId]>,
+        predicate: Option<Predicate>,
+    ) -> Vec<MemtableRange> {
+        let projection = if let Some(projection) = projection {
+            projection.iter().copied().collect()
+        } else {
+            self.region_metadata
+                .field_columns()
+                .map(|c| c.column_id)
+                .collect()
+        };
+        let builder = Box::new(TimeSeriesIterBuilder {
+            series_set: self.series_set.clone(),
+            projection,
+            predicate,
+            dedup: self.dedup,
+            merge_mode: self.merge_mode,
+        });
+        let context = Arc::new(MemtableRangeContext::new(self.id, builder));
+
+        vec![MemtableRange::new(context)]
     }
 
     fn is_empty(&self) -> bool {
@@ -277,6 +343,8 @@ impl Memtable for TimeSeriesMemtable {
             metadata.clone(),
             id,
             self.alloc_tracker.write_buffer_manager(),
+            self.dedup,
+            self.merge_mode,
         ))
     }
 }
@@ -299,6 +367,7 @@ impl Default for LocalStats {
 
 type SeriesRwLockMap = RwLock<BTreeMap<Vec<u8>, Arc<RwLock<Series>>>>;
 
+#[derive(Clone)]
 struct SeriesSet {
     region_metadata: RegionMetadataRef,
     series: Arc<SeriesRwLockMap>,
@@ -336,7 +405,12 @@ impl SeriesSet {
     }
 
     /// Iterates all series in [SeriesSet].
-    fn iter_series(&self, projection: HashSet<ColumnId>, predicate: Option<Predicate>) -> Iter {
+    fn iter_series(
+        &self,
+        projection: HashSet<ColumnId>,
+        predicate: Option<Predicate>,
+        dedup: bool,
+    ) -> Result<Iter> {
         let primary_key_schema = primary_key_schema(&self.region_metadata);
         let primary_key_datatypes = self
             .region_metadata
@@ -344,7 +418,7 @@ impl SeriesSet {
             .map(|pk| pk.column_schema.data_type.clone())
             .collect();
 
-        Iter::new(
+        Iter::try_new(
             self.region_metadata.clone(),
             self.series.clone(),
             projection,
@@ -352,6 +426,7 @@ impl SeriesSet {
             primary_key_schema,
             primary_key_datatypes,
             self.codec.clone(),
+            dedup,
         )
     }
 }
@@ -398,11 +473,13 @@ struct Iter {
     pk_schema: arrow::datatypes::SchemaRef,
     pk_datatypes: Vec<ConcreteDataType>,
     codec: Arc<McmpRowCodec>,
+    dedup: bool,
     metrics: Metrics,
 }
 
 impl Iter {
-    pub(crate) fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
         metadata: RegionMetadataRef,
         series: Arc<SeriesRwLockMap>,
         projection: HashSet<ColumnId>,
@@ -410,26 +487,29 @@ impl Iter {
         pk_schema: arrow::datatypes::SchemaRef,
         pk_datatypes: Vec<ConcreteDataType>,
         codec: Arc<McmpRowCodec>,
-    ) -> Self {
-        let simple_filters = predicate
-            .map(|p| {
-                p.exprs()
+        dedup: bool,
+    ) -> Result<Self> {
+        let predicate = predicate
+            .map(|predicate| {
+                predicate
+                    .exprs()
                     .iter()
-                    .filter_map(|f| SimpleFilterEvaluator::try_new(f.df_expr()))
+                    .filter_map(SimpleFilterEvaluator::try_new)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             metadata,
             series,
             projection,
             last_key: None,
-            predicate: simple_filters,
+            predicate,
             pk_schema,
             pk_datatypes,
             codec,
+            dedup,
             metrics: Metrics::default(),
-        }
+        })
     }
 }
 
@@ -484,8 +564,9 @@ impl Iterator for Iter {
             self.last_key = Some(primary_key.clone());
 
             let values = series.compact(&self.metadata);
-            let batch =
-                values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection));
+            let batch = values.and_then(|v| {
+                v.to_batch(primary_key, &self.metadata, &self.projection, self.dedup)
+            });
 
             // Update metrics.
             self.metrics.num_batches += 1;
@@ -703,6 +784,7 @@ impl Values {
         primary_key: &[u8],
         metadata: &RegionMetadataRef,
         projection: &HashSet<ColumnId>,
+        dedup: bool,
     ) -> Result<Batch> {
         let builder = BatchBuilder::with_required_columns(
             primary_key.to_vec(),
@@ -723,7 +805,7 @@ impl Values {
             .collect();
 
         let mut batch = builder.with_fields(fields).build()?;
-        batch.sort_and_dedup()?;
+        batch.sort(dedup)?;
         Ok(batch)
     }
 
@@ -794,9 +876,34 @@ impl From<ValueBuilder> for Values {
     }
 }
 
+struct TimeSeriesIterBuilder {
+    series_set: SeriesSet,
+    projection: HashSet<ColumnId>,
+    predicate: Option<Predicate>,
+    dedup: bool,
+    merge_mode: MergeMode,
+}
+
+impl IterBuilder for TimeSeriesIterBuilder {
+    fn build(&self) -> Result<BoxedBatchIterator> {
+        let iter = self.series_set.iter_series(
+            self.projection.clone(),
+            self.predicate.clone(),
+            self.dedup,
+        )?;
+
+        if self.merge_mode == MergeMode::LastNonNull {
+            let iter = LastNonNullIter::new(iter);
+            Ok(Box::new(iter))
+        } else {
+            Ok(Box::new(iter))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use api::helper::ColumnDataTypeWrapper;
     use api::v1::value::ValueData;
@@ -983,7 +1090,12 @@ mod tests {
         };
 
         let batch = values
-            .to_batch(b"test", &schema, &[0, 1, 2, 3, 4].into_iter().collect())
+            .to_batch(
+                b"test",
+                &schema,
+                &[0, 1, 2, 3, 4].into_iter().collect(),
+                true,
+            )
             .unwrap();
         check_value(
             &batch,
@@ -1147,18 +1259,29 @@ mod tests {
     #[test]
     fn test_memtable() {
         common_telemetry::init_default_ut_logging();
+        check_memtable_dedup(true);
+        check_memtable_dedup(false);
+    }
+
+    fn check_memtable_dedup(dedup: bool) {
         let schema = schema_for_test();
         let kvs = build_key_values(&schema, "hello".to_string(), 42, 100);
-        let memtable = TimeSeriesMemtable::new(schema, 42, None);
+        let memtable = TimeSeriesMemtable::new(schema, 42, None, dedup, MergeMode::LastRow);
+        memtable.write(&kvs).unwrap();
         memtable.write(&kvs).unwrap();
 
-        let expected_ts = kvs
+        let mut expected_ts: HashMap<i64, usize> = HashMap::new();
+        for ts in kvs
             .iter()
             .map(|kv| kv.timestamp().as_timestamp().unwrap().unwrap().value())
-            .collect::<HashSet<_>>();
+        {
+            *expected_ts.entry(ts).or_default() += if dedup { 1 } else { 2 };
+        }
 
         let iter = memtable.iter(None, None).unwrap();
-        let read = iter
+        let mut read = HashMap::new();
+
+        for ts in iter
             .flat_map(|batch| {
                 batch
                     .unwrap()
@@ -1171,7 +1294,9 @@ mod tests {
                     .into_iter()
             })
             .map(|v| v.unwrap().0.value())
-            .collect::<HashSet<_>>();
+        {
+            *read.entry(ts).or_default() += 1;
+        }
         assert_eq!(expected_ts, read);
 
         let stats = memtable.stats();
@@ -1190,7 +1315,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let schema = schema_for_test();
         let kvs = build_key_values(&schema, "hello".to_string(), 42, 100);
-        let memtable = TimeSeriesMemtable::new(schema, 42, None);
+        let memtable = TimeSeriesMemtable::new(schema, 42, None, true, MergeMode::LastRow);
         memtable.write(&kvs).unwrap();
 
         let iter = memtable.iter(Some(&[3]), None).unwrap();

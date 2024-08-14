@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use api::v1::column_def::try_as_column_schema;
+use api::v1::meta::Partition;
 use api::v1::{ColumnDataType, ColumnDef, CreateTableExpr, SemanticType};
 use chrono::DateTime;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO2_ENGINE};
@@ -24,39 +25,8 @@ use store_api::storage::TableId;
 use table::metadata::{RawTableInfo, RawTableMeta, TableIdent, TableType};
 use table::requests::TableOptions;
 
-#[derive(Default, Builder)]
-pub struct TestColumnDef {
-    #[builder(setter(into), default)]
-    name: String,
-    data_type: ColumnDataType,
-    #[builder(default)]
-    is_nullable: bool,
-    semantic_type: SemanticType,
-    #[builder(setter(into), default)]
-    comment: String,
-}
-
-impl From<TestColumnDef> for ColumnDef {
-    fn from(
-        TestColumnDef {
-            name,
-            data_type,
-            is_nullable,
-            semantic_type,
-            comment,
-        }: TestColumnDef,
-    ) -> Self {
-        Self {
-            name,
-            data_type: data_type as i32,
-            is_nullable,
-            default_constraint: vec![],
-            semantic_type: semantic_type as i32,
-            comment,
-            datatype_extension: None,
-        }
-    }
-}
+use crate::ddl::test_util::columns::TestColumnDefBuilder;
+use crate::rpc::ddl::CreateTableTask;
 
 #[derive(Default, Builder)]
 #[builder(default)]
@@ -77,6 +47,7 @@ pub struct TestCreateTableExpr {
     primary_keys: Vec<String>,
     create_if_not_exists: bool,
     table_options: HashMap<String, String>,
+    #[builder(setter(into, strip_option))]
     table_id: Option<TableId>,
     #[builder(setter(into), default = "MITO2_ENGINE.to_string()")]
     engine: String,
@@ -161,5 +132,49 @@ pub fn build_raw_table_info_from_expr(expr: &CreateTableExpr) -> RawTableInfo {
             partition_key_indices: vec![],
         },
         table_type: TableType::Base,
+    }
+}
+
+pub fn test_create_table_task(name: &str, table_id: TableId) -> CreateTableTask {
+    let create_table = TestCreateTableExprBuilder::default()
+        .column_defs([
+            TestColumnDefBuilder::default()
+                .name("ts")
+                .data_type(ColumnDataType::TimestampMillisecond)
+                .semantic_type(SemanticType::Timestamp)
+                .build()
+                .unwrap()
+                .into(),
+            TestColumnDefBuilder::default()
+                .name("host")
+                .data_type(ColumnDataType::String)
+                .semantic_type(SemanticType::Tag)
+                .build()
+                .unwrap()
+                .into(),
+            TestColumnDefBuilder::default()
+                .name("cpu")
+                .data_type(ColumnDataType::Float64)
+                .semantic_type(SemanticType::Field)
+                .build()
+                .unwrap()
+                .into(),
+        ])
+        .table_id(table_id)
+        .time_index("ts")
+        .primary_keys(["host".into()])
+        .table_name(name)
+        .build()
+        .unwrap()
+        .into();
+    let table_info = build_raw_table_info_from_expr(&create_table);
+    CreateTableTask {
+        create_table,
+        // Single region
+        partitions: vec![Partition {
+            column_list: vec![],
+            value_list: vec![],
+        }],
+        table_info,
     }
 }

@@ -15,6 +15,7 @@ RUST_TOOLCHAIN ?= $(shell cat rust-toolchain.toml | grep channel | cut -d'"' -f2
 CARGO_REGISTRY_CACHE ?= ${HOME}/.cargo/registry
 ARCH := $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 OUTPUT_DIR := $(shell if [ "$(RELEASE)" = "true" ]; then echo "release"; elif [ ! -z "$(CARGO_PROFILE)" ]; then echo "$(CARGO_PROFILE)" ; else echo "debug"; fi)
+SQLNESS_OPTS ?=
 
 # The arguments for running integration tests.
 ETCD_VERSION ?= v3.5.9
@@ -54,8 +55,10 @@ ifneq ($(strip $(RELEASE)),)
 	CARGO_BUILD_OPTS += --release
 endif
 
-ifeq ($(BUILDX_MULTI_PLATFORM_BUILD), true)
+ifeq ($(BUILDX_MULTI_PLATFORM_BUILD), all)
 	BUILDX_MULTI_PLATFORM_BUILD_OPTS := --platform linux/amd64,linux/arm64 --push
+else ifeq ($(BUILDX_MULTI_PLATFORM_BUILD), amd64)
+	BUILDX_MULTI_PLATFORM_BUILD_OPTS := --platform linux/amd64 --push
 else
 	BUILDX_MULTI_PLATFORM_BUILD_OPTS := -o type=docker
 endif
@@ -159,7 +162,18 @@ nextest: ## Install nextest tools.
 
 .PHONY: sqlness-test
 sqlness-test: ## Run sqlness test.
-	cargo sqlness
+	cargo sqlness ${SQLNESS_OPTS}
+
+# Run fuzz test ${FUZZ_TARGET}.
+RUNS ?= 1
+FUZZ_TARGET ?= fuzz_alter_table
+.PHONY: fuzz
+fuzz:
+	cargo fuzz run ${FUZZ_TARGET} --fuzz-dir tests-fuzz -D -s none -- -runs=${RUNS}
+
+.PHONY: fuzz-ls
+fuzz-ls:
+	cargo fuzz list --fuzz-dir tests-fuzz
 
 .PHONY: check
 check: ## Cargo check all the targets.
@@ -168,6 +182,10 @@ check: ## Cargo check all the targets.
 .PHONY: clippy
 clippy: ## Check clippy rules.
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+.PHONY: fix-clippy
+fix-clippy: ## Fix clippy violations.
+	cargo clippy --workspace --all-targets --all-features --fix
 
 .PHONY: fmt-check
 fmt-check: ## Check code format.
@@ -187,6 +205,24 @@ run-it-in-container: start-etcd ## Run integration tests in dev-builder.
 	-v ${PWD}:/greptimedb -v ${CARGO_REGISTRY_CACHE}:/root/.cargo/registry -v /tmp:/tmp \
 	-w /greptimedb ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/dev-builder-${BASE_IMAGE}:latest \
 	make test sqlness-test BUILD_JOBS=${BUILD_JOBS}
+
+.PHONY: start-cluster
+start-cluster: ## Start the greptimedb cluster with etcd by using docker compose.
+	 docker compose -f ./docker/docker-compose/cluster-with-etcd.yaml up
+
+.PHONY: stop-cluster
+stop-cluster: ## Stop the greptimedb cluster that created by docker compose.
+	docker compose -f ./docker/docker-compose/cluster-with-etcd.yaml stop
+
+##@ Docs
+config-docs: ## Generate configuration documentation from toml files.
+	docker run --rm \
+    -v ${PWD}:/greptimedb \
+    -w /greptimedb/config \
+    toml2docs/toml2docs:v0.1.1 \
+    -p '##' \
+    -t ./config-docs-template.md \
+    -o ./config.md
 
 ##@ General
 

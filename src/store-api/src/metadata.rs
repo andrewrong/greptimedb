@@ -21,19 +21,19 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use api::helper::ColumnDataTypeWrapper;
+use api::v1::column_def::try_as_column_schema;
 use api::v1::region::RegionColumnDef;
 use api::v1::SemanticType;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use datatypes::arrow::datatypes::FieldRef;
-use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, Schema, SchemaRef};
+use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
 use snafu::{ensure, Location, OptionExt, ResultExt, Snafu};
 
-use crate::region_request::{AddColumn, AddColumnLocation, AlterKind};
+use crate::region_request::{AddColumn, AddColumnLocation, AlterKind, ChangeColumnType};
 use crate::storage::consts::is_internal_column;
 use crate::storage::{ColumnId, RegionId};
 
@@ -64,36 +64,33 @@ impl ColumnMetadata {
     /// Construct `Self` from protobuf struct [RegionColumnDef]
     pub fn try_from_column_def(column_def: RegionColumnDef) -> Result<Self> {
         let column_id = column_def.column_id;
-
         let column_def = column_def
             .column_def
             .context(InvalidRawRegionRequestSnafu {
                 err: "column_def is absent",
             })?;
-
         let semantic_type = column_def.semantic_type();
+        let column_schema = try_as_column_schema(&column_def).context(ConvertColumnSchemaSnafu)?;
 
-        let default_constrain = if column_def.default_constraint.is_empty() {
-            None
-        } else {
-            Some(
-                ColumnDefaultConstraint::try_from(column_def.default_constraint.as_slice())
-                    .context(ConvertDatatypesSnafu)?,
-            )
-        };
-        let data_type = ColumnDataTypeWrapper::new(
-            column_def.data_type(),
-            column_def.datatype_extension.clone(),
-        )
-        .into();
-        let column_schema = ColumnSchema::new(column_def.name, data_type, column_def.is_nullable)
-            .with_default_constraint(default_constrain)
-            .context(ConvertDatatypesSnafu)?;
         Ok(Self {
             column_schema,
             semantic_type,
             column_id,
         })
+    }
+
+    /// Encodes a vector of `ColumnMetadata` into a JSON byte vector.
+    pub fn encode_list(columns: &[Self]) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(columns)
+    }
+
+    /// Decodes a JSON byte vector into a vector of `ColumnMetadata`.
+    pub fn decode_list(bytes: &[u8]) -> serde_json::Result<Vec<Self>> {
+        serde_json::from_slice(bytes)
+    }
+
+    pub fn is_same_datatype(&self, other: &Self) -> bool {
+        self.column_schema.data_type == other.column_schema.data_type
     }
 }
 
@@ -525,6 +522,7 @@ impl RegionMetadataBuilder {
         match kind {
             AlterKind::AddColumns { columns } => self.add_columns(columns)?,
             AlterKind::DropColumns { names } => self.drop_columns(&names),
+            AlterKind::ChangeColumnTypes { columns } => self.change_column_types(columns),
         }
         Ok(self)
     }
@@ -605,6 +603,25 @@ impl RegionMetadataBuilder {
         self.column_metadatas
             .retain(|col| !name_set.contains(&col.column_schema.name));
     }
+
+    /// Changes columns type to the metadata if exist.
+    fn change_column_types(&mut self, columns: Vec<ChangeColumnType>) {
+        let mut change_type_map: HashMap<_, _> = columns
+            .into_iter()
+            .map(
+                |ChangeColumnType {
+                     column_name,
+                     target_type,
+                 }| (column_name, target_type),
+            )
+            .collect();
+
+        for column_meta in self.column_metadatas.iter_mut() {
+            if let Some(target_type) = change_type_map.remove(&column_meta.column_schema.name) {
+                column_meta.column_schema.data_type = target_type;
+            }
+        }
+    }
 }
 
 /// Fields skipped in serialization.
@@ -658,32 +675,37 @@ pub enum MetadataError {
     #[snafu(display("Invalid schema"))]
     InvalidSchema {
         source: datatypes::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid metadata, {}", reason))]
-    InvalidMeta { reason: String, location: Location },
+    InvalidMeta {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to ser/de json object"))]
     SerdeJson {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: serde_json::Error,
     },
 
-    #[snafu(display("Failed to convert struct from datatypes"))]
-    ConvertDatatypes {
-        location: Location,
-        source: datatypes::error::Error,
-    },
-
     #[snafu(display("Invalid raw region request, err: {}", err))]
-    InvalidRawRegionRequest { err: String, location: Location },
+    InvalidRawRegionRequest {
+        err: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid region request, region_id: {}, err: {}", region_id, err))]
     InvalidRegionRequest {
         region_id: RegionId,
         err: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -691,12 +713,31 @@ pub enum MetadataError {
     SchemaProject {
         origin_schema: SchemaRef,
         projection: Vec<ColumnId>,
+        #[snafu(implicit)]
         location: Location,
         source: datatypes::Error,
     },
 
     #[snafu(display("Time index column not found"))]
-    TimeIndexNotFound { location: Location },
+    TimeIndexNotFound {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Change column {} not exists in region: {}", column_name, region_id))]
+    ChangeColumnNotFound {
+        column_name: String,
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to convert column schema"))]
+    ConvertColumnSchema {
+        source: api::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for MetadataError {
@@ -1102,7 +1143,7 @@ mod test {
         let metadata = builder.build().unwrap();
         check_columns(&metadata, &["a", "b", "f", "c", "d"]);
 
-        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        let mut builder = RegionMetadataBuilder::from_existing(metadata.clone());
         builder
             .alter(AlterKind::DropColumns {
                 names: vec!["a".to_string()],
@@ -1111,6 +1152,24 @@ mod test {
         // Build returns error as the primary key contains a.
         let err = builder.build().unwrap_err();
         assert_eq!(StatusCode::InvalidArguments, err.status_code());
+
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::ChangeColumnTypes {
+                columns: vec![ChangeColumnType {
+                    column_name: "b".to_string(),
+                    target_type: ConcreteDataType::string_datatype(),
+                }],
+            })
+            .unwrap();
+        let metadata = builder.build().unwrap();
+        check_columns(&metadata, &["a", "b", "f", "c", "d"]);
+        let b_type = &metadata
+            .column_by_name("b")
+            .unwrap()
+            .column_schema
+            .data_type;
+        assert_eq!(ConcreteDataType::string_datatype(), *b_type);
     }
 
     #[test]

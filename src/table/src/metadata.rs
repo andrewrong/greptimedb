@@ -23,11 +23,11 @@ pub use datatypes::error::{Error as ConvertError, Result as ConvertResult};
 use datatypes::schema::{ColumnSchema, RawSchema, Schema, SchemaBuilder, SchemaRef};
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
-use snafu::{ensure, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::{ColumnDescriptor, ColumnDescriptorBuilder, ColumnId, RegionId};
 
 use crate::error::{self, Result};
-use crate::requests::{AddColumnRequest, AlterKind, TableOptions};
+use crate::requests::{AddColumnRequest, AlterKind, ChangeColumnTypeRequest, TableOptions};
 
 pub type TableId = u32;
 pub type TableVersion = u64;
@@ -188,10 +188,16 @@ impl TableMeta {
         &self,
         table_name: &str,
         alter_kind: &AlterKind,
+        add_if_not_exists: bool,
     ) -> Result<TableMetaBuilder> {
         match alter_kind {
-            AlterKind::AddColumns { columns } => self.add_columns(table_name, columns),
+            AlterKind::AddColumns { columns } => {
+                self.add_columns(table_name, columns, add_if_not_exists)
+            }
             AlterKind::DropColumns { names } => self.remove_columns(table_name, names),
+            AlterKind::ChangeColumnTypes { columns } => {
+                self.change_column_types(table_name, columns)
+            }
             // No need to rebuild table meta when renaming tables.
             AlterKind::RenameTable { .. } => {
                 let mut meta_builder = TableMetaBuilder::default();
@@ -248,6 +254,7 @@ impl TableMeta {
         &self,
         table_name: &str,
         requests: &[AddColumnRequest],
+        add_if_not_exists: bool,
     ) -> Result<TableMetaBuilder> {
         let table_schema = &self.schema;
         let mut meta_builder = self.new_meta_builder();
@@ -255,7 +262,31 @@ impl TableMeta {
             self.primary_key_indices.iter().collect();
 
         let mut names = HashSet::with_capacity(requests.len());
-
+        let mut new_requests = Vec::with_capacity(requests.len());
+        let requests = if add_if_not_exists {
+            for col_to_add in requests {
+                if let Some(column_schema) =
+                    table_schema.column_schema_by_name(&col_to_add.column_schema.name)
+                {
+                    // If the column already exists, we should check if the type is the same.
+                    ensure!(
+                        column_schema.data_type == col_to_add.column_schema.data_type,
+                        error::InvalidAlterRequestSnafu {
+                            table: table_name,
+                            err: format!(
+                                "column {} already exists with different type",
+                                col_to_add.column_schema.name
+                            ),
+                        }
+                    );
+                } else {
+                    new_requests.push(col_to_add.clone());
+                }
+            }
+            &new_requests[..]
+        } else {
+            requests
+        };
         for col_to_add in requests {
             ensure!(
                 names.insert(&col_to_add.column_schema.name),
@@ -430,6 +461,133 @@ impl TableMeta {
         Ok(meta_builder)
     }
 
+    fn change_column_types(
+        &self,
+        table_name: &str,
+        requests: &[ChangeColumnTypeRequest],
+    ) -> Result<TableMetaBuilder> {
+        let table_schema = &self.schema;
+        let mut meta_builder = self.new_meta_builder();
+
+        let mut change_column_types = HashMap::with_capacity(requests.len());
+        let timestamp_index = table_schema.timestamp_index();
+
+        for col_to_change in requests {
+            let change_column_name = &col_to_change.column_name;
+
+            let index = table_schema
+                .column_index_by_name(change_column_name)
+                .with_context(|| error::ColumnNotExistsSnafu {
+                    column_name: change_column_name,
+                    table_name,
+                })?;
+
+            let column = &table_schema.column_schemas()[index];
+
+            ensure!(
+                !self.primary_key_indices.contains(&index),
+                error::InvalidAlterRequestSnafu {
+                    table: table_name,
+                    err: format!(
+                        "Not allowed to change primary key index column '{}'",
+                        column.name
+                    )
+                }
+            );
+
+            if let Some(ts_index) = timestamp_index {
+                // Not allowed to change column datatype in timestamp index.
+                ensure!(
+                    index != ts_index,
+                    error::InvalidAlterRequestSnafu {
+                        table: table_name,
+                        err: format!(
+                            "Not allowed to change timestamp index column '{}' datatype",
+                            column.name
+                        )
+                    }
+                );
+            }
+
+            ensure!(
+                change_column_types
+                    .insert(&col_to_change.column_name, col_to_change)
+                    .is_none(),
+                error::InvalidAlterRequestSnafu {
+                    table: table_name,
+                    err: format!(
+                        "change column datatype {} more than once",
+                        col_to_change.column_name
+                    ),
+                }
+            );
+
+            ensure!(
+                column
+                    .data_type
+                    .can_arrow_type_cast_to(&col_to_change.target_type),
+                error::InvalidAlterRequestSnafu {
+                    table: table_name,
+                    err: format!(
+                        "column '{}' cannot be cast automatically to type '{}'",
+                        col_to_change.column_name, col_to_change.target_type,
+                    ),
+                }
+            );
+
+            ensure!(
+                column.is_nullable(),
+                error::InvalidAlterRequestSnafu {
+                    table: table_name,
+                    err: format!(
+                        "column '{}' must be nullable to ensure safe conversion.",
+                        col_to_change.column_name,
+                    ),
+                }
+            );
+        }
+        // Collect columns after changed.
+        let columns: Vec<_> = table_schema
+            .column_schemas()
+            .iter()
+            .cloned()
+            .map(|mut column| {
+                if let Some(change_column) = change_column_types.get(&column.name) {
+                    column.data_type = change_column.target_type.clone();
+                }
+                column
+            })
+            .collect();
+
+        let mut builder = SchemaBuilder::try_from_columns(columns)
+            .with_context(|_| error::SchemaBuildSnafu {
+                msg: format!("Failed to convert column schemas into schema for table {table_name}"),
+            })?
+            // Also bump the schema version.
+            .version(table_schema.version() + 1);
+        for (k, v) in table_schema.metadata().iter() {
+            builder = builder.add_metadata(k, v);
+        }
+        let new_schema = builder.build().with_context(|_| {
+            let column_names: Vec<_> = requests
+                .iter()
+                .map(|request| &request.column_name)
+                .collect();
+
+            error::SchemaBuildSnafu {
+                msg: format!(
+                    "Table {table_name} cannot change datatype with columns {column_names:?}"
+                ),
+            }
+        })?;
+
+        let _ = meta_builder
+            .schema(Arc::new(new_schema))
+            .primary_key_indices(self.primary_key_indices.clone());
+
+        Ok(meta_builder)
+    }
+
     /// Split requests into different groups using column location info.
     fn split_requests_by_column_location<'a>(
         &self,
@@ -489,8 +647,6 @@ pub struct TableInfo {
     /// Id and version of the table.
     #[builder(default, setter(into))]
     pub ident: TableIdent,
-
-    // TODO(LFC): Remove the catalog, schema and table names from TableInfo.
     /// Name of the table.
     #[builder(setter(into))]
     pub name: String,
@@ -564,16 +720,22 @@ impl From<TableId> for TableIdent {
 }
 
 /// Struct used to serialize and deserialize [`TableMeta`].
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Default)]
 pub struct RawTableMeta {
     pub schema: RawSchema,
+    /// The indices of columns in primary key. Note that the index of timestamp column
+    /// is not included. Order matters to this array.
     pub primary_key_indices: Vec<usize>,
+    ///  The indices of columns in value. Order doesn't matter to this array.
     pub value_indices: Vec<usize>,
+    /// Engine type of this table. Usually in small case.
     pub engine: String,
+    /// Deprecated. See https://github.com/GreptimeTeam/greptimedb/issues/2982
     pub next_column_id: ColumnId,
     pub region_numbers: Vec<u32>,
     pub options: TableOptions,
     pub created_on: DateTime<Utc>,
+    /// Order doesn't matter to this array.
     #[serde(default)]
     pub partition_key_indices: Vec<usize>,
 }
@@ -622,6 +784,44 @@ pub struct RawTableInfo {
     pub schema_name: String,
     pub meta: RawTableMeta,
     pub table_type: TableType,
+}
+
+impl RawTableInfo {
+    /// Sort the columns in [RawTableInfo], logical tables require it.
+    pub fn sort_columns(&mut self) {
+        let column_schemas = &self.meta.schema.column_schemas;
+        let primary_keys = self
+            .meta
+            .primary_key_indices
+            .iter()
+            .map(|index| column_schemas[*index].name.clone())
+            .collect::<HashSet<_>>();
+
+        self.meta
+            .schema
+            .column_schemas
+            .sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
+        // Compute new indices of sorted columns
+        let mut primary_key_indices = Vec::with_capacity(primary_keys.len());
+        let mut timestamp_index = None;
+        let mut value_indices =
+            Vec::with_capacity(self.meta.schema.column_schemas.len() - primary_keys.len() - 1);
+        for (index, column_schema) in self.meta.schema.column_schemas.iter().enumerate() {
+            if primary_keys.contains(&column_schema.name) {
+                primary_key_indices.push(index);
+            } else if column_schema.is_time_index() {
+                timestamp_index = Some(index);
+            } else {
+                value_indices.push(index);
+            }
+        }
+
+        // Overwrite table meta
+        self.meta.schema.timestamp_index = timestamp_index;
+        self.meta.primary_key_indices = primary_key_indices;
+        self.meta.value_indices = value_indices;
+    }
 }
 
 impl From<TableInfo> for RawTableInfo {
@@ -725,7 +925,7 @@ mod tests {
         };
 
         let builder = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .unwrap();
         builder.build().unwrap()
     }
@@ -755,7 +955,7 @@ mod tests {
         };
 
         let builder = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .unwrap();
         builder.build().unwrap()
     }
@@ -802,7 +1002,7 @@ mod tests {
             names: vec![String::from("col2"), String::from("my_field")],
         };
         let new_meta = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .unwrap()
             .build()
             .unwrap();
@@ -857,7 +1057,7 @@ mod tests {
             names: vec![String::from("col3"), String::from("col1")],
         };
         let new_meta = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .unwrap()
             .build()
             .unwrap();
@@ -897,7 +1097,7 @@ mod tests {
         };
 
         let err = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .err()
             .unwrap();
         assert_eq!(StatusCode::TableColumnExists, err.status_code());
@@ -927,7 +1127,7 @@ mod tests {
         };
 
         let err = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .err()
             .unwrap();
         assert_eq!(StatusCode::InvalidArguments, err.status_code());
@@ -949,7 +1149,32 @@ mod tests {
         };
 
         let err = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
+            .err()
+            .unwrap();
+        assert_eq!(StatusCode::TableColumnNotFound, err.status_code());
+    }
+
+    #[test]
+    fn test_change_unknown_column_data_type() {
+        let schema = Arc::new(new_test_schema());
+        let meta = TableMetaBuilder::default()
+            .schema(schema)
+            .primary_key_indices(vec![0])
+            .engine("engine")
+            .next_column_id(3)
+            .build()
+            .unwrap();
+
+        let alter_kind = AlterKind::ChangeColumnTypes {
+            columns: vec![ChangeColumnTypeRequest {
+                column_name: "unknown".to_string(),
+                target_type: ConcreteDataType::string_datatype(),
+            }],
+        };
+
+        let err = meta
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .err()
             .unwrap();
         assert_eq!(StatusCode::TableColumnNotFound, err.status_code());
@@ -972,7 +1197,7 @@ mod tests {
         };
 
         let err = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .err()
             .unwrap();
         assert_eq!(StatusCode::InvalidArguments, err.status_code());
@@ -983,7 +1208,47 @@ mod tests {
         };
 
         let err = meta
-            .builder_with_alter_kind("my_table", &alter_kind)
+            .builder_with_alter_kind("my_table", &alter_kind, false)
+            .err()
+            .unwrap();
+        assert_eq!(StatusCode::InvalidArguments, err.status_code());
+    }
+
+    #[test]
+    fn test_change_key_column_data_type() {
+        let schema = Arc::new(new_test_schema());
+        let meta = TableMetaBuilder::default()
+            .schema(schema)
+            .primary_key_indices(vec![0])
+            .engine("engine")
+            .next_column_id(3)
+            .build()
+            .unwrap();
+
+        // Remove column in primary key.
+        let alter_kind = AlterKind::ChangeColumnTypes {
+            columns: vec![ChangeColumnTypeRequest {
+                column_name: "col1".to_string(),
+                target_type: ConcreteDataType::string_datatype(),
+            }],
+        };
+
+        let err = meta
+            .builder_with_alter_kind("my_table", &alter_kind, false)
+            .err()
+            .unwrap();
+        assert_eq!(StatusCode::InvalidArguments, err.status_code());
+
+        // Remove timestamp column.
+        let alter_kind = AlterKind::ChangeColumnTypes {
+            columns: vec![ChangeColumnTypeRequest {
+                column_name: "ts".to_string(),
+                target_type: ConcreteDataType::string_datatype(),
+            }],
+        };
+
+        let err = meta
+            .builder_with_alter_kind("my_table", &alter_kind, false)
             .err()
             .unwrap();
         assert_eq!(StatusCode::InvalidArguments, err.status_code());

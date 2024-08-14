@@ -23,6 +23,7 @@ use mime_guess::mime;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::process_with_limit;
 use crate::http::error_result::ErrorResponse;
 use crate::http::header::{GREPTIME_DB_HEADER_EXECUTION_TIME, GREPTIME_DB_HEADER_FORMAT};
 use crate::http::{handler, GreptimeQueryOutput, HttpResponse, ResponseFormat};
@@ -35,14 +36,13 @@ pub struct CsvResponse {
 
 impl CsvResponse {
     pub async fn from_output(outputs: Vec<crate::error::Result<Output>>) -> HttpResponse {
-        match handler::from_output(ResponseFormat::Csv, outputs).await {
+        match handler::from_output(outputs).await {
             Err(err) => HttpResponse::Error(err),
             Ok((output, _)) => {
                 if output.len() > 1 {
                     HttpResponse::Error(ErrorResponse::from_error_message(
-                        ResponseFormat::Csv,
                         StatusCode::InvalidArguments,
-                        "Multi-statements are not allowed".to_string(),
+                        "cannot output multi-statements result in csv format".to_string(),
                     ))
                 } else {
                     HttpResponse::Csv(CsvResponse {
@@ -65,6 +65,11 @@ impl CsvResponse {
 
     pub fn execution_time_ms(&self) -> u64 {
         self.execution_time_ms
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.output = process_with_limit(self.output, limit);
+        self
     }
 }
 
@@ -100,8 +105,10 @@ impl IntoResponse for CsvResponse {
             payload,
         )
             .into_response();
-        resp.headers_mut()
-            .insert(&GREPTIME_DB_HEADER_FORMAT, HeaderValue::from_static("CSV"));
+        resp.headers_mut().insert(
+            &GREPTIME_DB_HEADER_FORMAT,
+            HeaderValue::from_static(ResponseFormat::Csv.as_str()),
+        );
         resp.headers_mut().insert(
             &GREPTIME_DB_HEADER_EXECUTION_TIME,
             HeaderValue::from(execution_time),

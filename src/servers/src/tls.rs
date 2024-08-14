@@ -200,21 +200,21 @@ pub fn maybe_watch_tls_config(tls_server_config: Arc<ReloadableTlsServerConfig>)
     let tls_server_config_for_watcher = tls_server_config.clone();
 
     let (tx, rx) = channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::recommended_watcher(tx).context(FileWatchSnafu)?;
+    let mut watcher = notify::recommended_watcher(tx).context(FileWatchSnafu { path: "<none>" })?;
 
+    let cert_path = tls_server_config.get_tls_option().cert_path();
     watcher
-        .watch(
-            tls_server_config.get_tls_option().cert_path(),
-            RecursiveMode::NonRecursive,
-        )
-        .context(FileWatchSnafu)?;
+        .watch(cert_path, RecursiveMode::NonRecursive)
+        .with_context(|_| FileWatchSnafu {
+            path: cert_path.display().to_string(),
+        })?;
 
+    let key_path = tls_server_config.get_tls_option().key_path();
     watcher
-        .watch(
-            tls_server_config.get_tls_option().key_path(),
-            RecursiveMode::NonRecursive,
-        )
-        .context(FileWatchSnafu)?;
+        .watch(key_path, RecursiveMode::NonRecursive)
+        .with_context(|_| FileWatchSnafu {
+            path: key_path.display().to_string(),
+        })?;
 
     std::thread::spawn(move || {
         let _watcher = watcher;
@@ -391,6 +391,8 @@ mod tests {
 
     #[test]
     fn test_tls_file_change_watch() {
+        common_telemetry::init_default_ut_logging();
+
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("serevr.crt");
         let key_path = dir.path().join("server.key");
@@ -425,7 +427,13 @@ mod tests {
             .expect("failed to copy key to tmpdir");
 
         // waiting for async load
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        #[cfg(not(target_os = "windows"))]
+        let timeout_millis = 300;
+        #[cfg(target_os = "windows")]
+        let timeout_millis = 2000;
+
+        std::thread::sleep(std::time::Duration::from_millis(timeout_millis));
+
         assert!(server_config.get_version() > 1);
         assert!(server_config.get_server_config().is_some());
     }

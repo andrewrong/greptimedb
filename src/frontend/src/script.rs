@@ -13,17 +13,14 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use catalog::CatalogManagerRef;
 use common_query::Output;
 use query::QueryEngineRef;
-use servers::query_handler::grpc::GrpcQueryHandler;
 use session::context::QueryContextRef;
 
-use crate::error::{Error, Result};
-
-type FrontendGrpcQueryHandlerRef = Arc<dyn GrpcQueryHandler<Error = Error> + Send + Sync>;
+use crate::error::Result;
+use crate::instance::Instance;
 
 #[cfg(not(feature = "python"))]
 mod dummy {
@@ -39,7 +36,7 @@ mod dummy {
             Ok(Self {})
         }
 
-        pub fn start(&self, instance: &Instance) -> Result<()> {
+        pub fn start(&self, _instance: &Instance) -> Result<()> {
             Ok(())
         }
 
@@ -65,24 +62,25 @@ mod dummy {
 
 #[cfg(feature = "python")]
 mod python {
+    use std::sync::Arc;
+
     use api::v1::ddl_request::Expr;
     use api::v1::greptime_request::Request;
-    use api::v1::{CreateTableExpr, DdlRequest};
+    use api::v1::DdlRequest;
     use arc_swap::ArcSwap;
     use catalog::RegisterSystemTableRequest;
-    use common_error::ext::BoxedError;
-    use common_meta::table_name::TableName;
+    use common_error::ext::{BoxedError, ErrorExt};
     use common_telemetry::{error, info};
-    use operator::expr_factory;
     use script::manager::ScriptManager;
     use servers::query_handler::grpc::GrpcQueryHandler;
     use session::context::QueryContext;
     use snafu::{OptionExt, ResultExt};
-    use table::requests::CreateTableRequest;
+    use table::table_name::TableName;
 
     use super::*;
-    use crate::error::{CatalogSnafu, InvalidSystemTableDefSnafu, TableNotFoundSnafu};
-    use crate::instance::Instance;
+    use crate::error::{CatalogSnafu, Error, TableNotFoundSnafu};
+
+    type FrontendGrpcQueryHandlerRef = Arc<dyn GrpcQueryHandler<Error = Error> + Send + Sync>;
 
     /// A placeholder for the real gRPC handler.
     /// It is temporary and will be replaced soon.
@@ -148,17 +146,13 @@ mod python {
             }
 
             let RegisterSystemTableRequest {
-                create_table_request: request,
+                create_table_expr: expr,
                 open_hook,
             } = self.script_manager.create_table_request(catalog);
 
             if let Some(table) = self
                 .catalog_manager
-                .table(
-                    &request.catalog_name,
-                    &request.schema_name,
-                    &request.table_name,
-                )
+                .table(&expr.catalog_name, &expr.schema_name, &expr.table_name)
                 .await
                 .context(CatalogSnafu)?
             {
@@ -171,13 +165,8 @@ mod python {
                 return Ok(());
             }
 
-            let table_name = TableName::new(
-                &request.catalog_name,
-                &request.schema_name,
-                &request.table_name,
-            );
-
-            let expr = Self::create_table_expr(request)?;
+            let table_name =
+                TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
 
             let _ = self
                 .grpc_handler
@@ -217,46 +206,6 @@ mod python {
             Ok(())
         }
 
-        fn create_table_expr(request: CreateTableRequest) -> Result<CreateTableExpr> {
-            let column_schemas = request.schema.column_schemas;
-
-            let time_index = column_schemas
-                .iter()
-                .find_map(|x| {
-                    if x.is_time_index() {
-                        Some(x.name.clone())
-                    } else {
-                        None
-                    }
-                })
-                .context(InvalidSystemTableDefSnafu {
-                    err_msg: "Time index is not defined.",
-                })?;
-
-            let primary_keys = request
-                .primary_key_indices
-                .iter()
-                // Indexing has to be safe because the create script table request is pre-defined.
-                .map(|i| column_schemas[*i].name.clone())
-                .collect::<Vec<_>>();
-
-            let column_defs = expr_factory::column_schemas_to_defs(column_schemas, &primary_keys)?;
-
-            Ok(CreateTableExpr {
-                catalog_name: request.catalog_name,
-                schema_name: request.schema_name,
-                table_name: request.table_name,
-                desc: request.desc.unwrap_or_default(),
-                column_defs,
-                time_index,
-                primary_keys,
-                create_if_not_exists: request.create_if_not_exists,
-                table_options: (&request.table_options).into(),
-                table_id: None, // Should and will be assigned by Meta.
-                engine: request.engine,
-            })
-        }
-
         pub async fn insert_script(
             &self,
             query_ctx: QueryContextRef,
@@ -266,7 +215,10 @@ mod python {
             self.create_scripts_table_if_need(query_ctx.current_catalog())
                 .await
                 .map_err(|e| {
-                    error!(e; "Failed to create scripts table");
+                    if e.status_code().should_log_error() {
+                        error!(e; "Failed to create scripts table");
+                    }
+
                     servers::error::InternalSnafu {
                         err_msg: e.to_string(),
                     }
@@ -277,13 +229,16 @@ mod python {
                 .script_manager
                 .insert_and_compile(
                     query_ctx.current_catalog(),
-                    query_ctx.current_schema(),
+                    &query_ctx.current_schema(),
                     name,
                     script,
                 )
                 .await
                 .map_err(|e| {
-                    error!(e; "Failed to insert script");
+                    if e.status_code().should_log_error() {
+                        error!(e; "Failed to insert script");
+                    }
+
                     BoxedError::new(e)
                 })
                 .context(servers::error::InsertScriptSnafu { name })?;
@@ -310,13 +265,16 @@ mod python {
             self.script_manager
                 .execute(
                     query_ctx.current_catalog(),
-                    query_ctx.current_schema(),
+                    &query_ctx.current_schema(),
                     name,
                     params,
                 )
                 .await
                 .map_err(|e| {
-                    error!(e; "Failed to execute script");
+                    if e.status_code().should_log_error() {
+                        error!(e; "Failed to execute script");
+                    }
+
                     BoxedError::new(e)
                 })
                 .context(servers::error::ExecuteScriptSnafu { name })

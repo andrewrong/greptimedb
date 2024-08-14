@@ -19,7 +19,6 @@ use api::v1::RowInsertRequests;
 use async_trait::async_trait;
 use auth::tests::{DatabaseAuthInfo, MockUserProvider};
 use axum::{http, Router};
-use axum_test_helper::TestClient;
 use common_query::Output;
 use common_test_util::ports;
 use query::parser::PromQuery;
@@ -27,7 +26,7 @@ use query::plan::LogicalPlan;
 use query::query_engine::DescribeResult;
 use servers::error::{Error, Result};
 use servers::http::header::constants::GREPTIME_DB_HEADER_NAME;
-use servers::http::header::GREPTIME_DB_HEADER_FORMAT;
+use servers::http::test_helpers::TestClient;
 use servers::http::{HttpOptions, HttpServerBuilder};
 use servers::influxdb::InfluxdbRequest;
 use servers::query_handler::grpc::GrpcQueryHandler;
@@ -58,10 +57,7 @@ impl InfluxdbLineProtocolHandler for DummyInstance {
     async fn exec(&self, request: InfluxdbRequest, ctx: QueryContextRef) -> Result<Output> {
         let requests: RowInsertRequests = request.try_into()?;
         for expr in requests.inserts {
-            let _ = self
-                .tx
-                .send((ctx.current_schema().to_owned(), expr.table_name))
-                .await;
+            let _ = self.tx.send((ctx.current_schema(), expr.table_name)).await;
         }
 
         Ok(Output::new_with_affected_rows(0))
@@ -183,10 +179,6 @@ async fn test_influxdb_write() {
         .await;
     assert_eq!(result.status(), 401);
     assert_eq!(
-        result.headers().get(&GREPTIME_DB_HEADER_FORMAT).unwrap(),
-        "influxdb_v1",
-    );
-    assert_eq!(
         "{\"code\":7002,\"error\":\"Username and password does not match, username: greptime\",\"execution_time_ms\":0}",
         result.text().await
     );
@@ -198,10 +190,6 @@ async fn test_influxdb_write() {
         .send()
         .await;
     assert_eq!(result.status(), 401);
-    assert_eq!(
-        result.headers().get(&GREPTIME_DB_HEADER_FORMAT).unwrap(),
-        "influxdb_v1",
-    );
     assert_eq!(
         "{\"code\":7003,\"error\":\"Not found influx http authorization info\",\"execution_time_ms\":0}",
         result.text().await

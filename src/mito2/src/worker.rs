@@ -21,6 +21,7 @@ mod handle_compaction;
 mod handle_create;
 mod handle_drop;
 mod handle_flush;
+mod handle_manifest;
 mod handle_open;
 mod handle_truncate;
 mod handle_write;
@@ -29,34 +30,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use common_base::Plugins;
 use common_runtime::JoinHandle;
 use common_telemetry::{error, info, warn};
 use futures::future::try_join_all;
 use object_store::manager::ObjectStoreManagerRef;
+use prometheus::IntGauge;
 use rand::{thread_rng, Rng};
 use snafu::{ensure, ResultExt};
 use store_api::logstore::LogStore;
 use store_api::region_engine::SetReadonlyResponse;
 use store_api::storage::RegionId;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::cache::write_cache::{WriteCache, WriteCacheRef};
 use crate::cache::{CacheManager, CacheManagerRef};
 use crate::compaction::CompactionScheduler;
 use crate::config::MitoConfig;
-use crate::error::{InvalidRequestSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
+use crate::error::{JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
-use crate::manifest::action::RegionEdit;
-use crate::memtable::merge_tree::MergeTreeMemtableBuilder;
-use crate::memtable::time_series::TimeSeriesMemtableBuilder;
-use crate::memtable::{MemtableBuilderRef, MemtableConfig};
-use crate::region::{MitoRegionRef, RegionMap, RegionMapRef};
+use crate::memtable::MemtableBuilderProvider;
+use crate::metrics::{REGION_COUNT, WRITE_STALL_TOTAL};
+use crate::region::{MitoRegionRef, OpeningRegions, OpeningRegionsRef, RegionMap, RegionMapRef};
 use crate::request::{
     BackgroundNotify, DdlRequest, SenderDdlRequest, SenderWriteRequest, WorkerRequest,
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
 use crate::sst::index::intermediate::IntermediateManager;
+use crate::sst::index::puffin_manager::PuffinManagerFactory;
 use crate::time_provider::{StdTimeProvider, TimeProviderRef};
 use crate::wal::Wal;
 
@@ -112,6 +114,8 @@ pub(crate) struct WorkerGroup {
     workers: Vec<RegionWorker>,
     /// Global background job scheduelr.
     scheduler: SchedulerRef,
+    /// Scheduler for file purgers.
+    purge_scheduler: SchedulerRef,
     /// Cache.
     cache_manager: CacheManagerRef,
 }
@@ -124,18 +128,30 @@ impl WorkerGroup {
         config: Arc<MitoConfig>,
         log_store: Arc<S>,
         object_store_manager: ObjectStoreManagerRef,
+        plugins: Plugins,
     ) -> Result<WorkerGroup> {
-        let write_buffer_manager = Arc::new(WriteBufferManagerImpl::new(
-            config.global_write_buffer_size.as_bytes() as usize,
-        ));
-        let intermediate_manager =
-            IntermediateManager::init_fs(&config.inverted_index.intermediate_path)
-                .await?
-                .with_buffer_size(Some(config.inverted_index.write_buffer_size.as_bytes() as _));
+        let (flush_sender, flush_receiver) = watch::channel(());
+        let write_buffer_manager = Arc::new(
+            WriteBufferManagerImpl::new(config.global_write_buffer_size.as_bytes() as usize)
+                .with_notifier(flush_sender.clone()),
+        );
+        let puffin_manager_factory = PuffinManagerFactory::new(
+            &config.index.aux_path,
+            config.index.staging_size.as_bytes(),
+            Some(config.index.write_buffer_size.as_bytes() as _),
+        )
+        .await?;
+        let intermediate_manager = IntermediateManager::init_fs(&config.index.aux_path)
+            .await?
+            .with_buffer_size(Some(config.index.write_buffer_size.as_bytes() as _));
         let scheduler = Arc::new(LocalScheduler::new(config.max_background_jobs));
+        // We use another scheduler to avoid purge jobs blocking other jobs.
+        // A purge job is cheaper than other background jobs so they share the same job limit.
+        let purge_scheduler = Arc::new(LocalScheduler::new(config.max_background_jobs));
         let write_cache = write_cache_from_config(
             &config,
             object_store_manager.clone(),
+            puffin_manager_factory.clone(),
             intermediate_manager.clone(),
         )
         .await?;
@@ -144,6 +160,9 @@ impl WorkerGroup {
                 .sst_meta_cache_size(config.sst_meta_cache_size.as_bytes())
                 .vector_cache_size(config.vector_cache_size.as_bytes())
                 .page_cache_size(config.page_cache_size.as_bytes())
+                .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
+                .index_metadata_size(config.inverted_index.metadata_cache_size.as_bytes())
+                .index_content_size(config.inverted_index.content_cache_size.as_bytes())
                 .write_cache(write_cache)
                 .build(),
         );
@@ -158,10 +177,15 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     scheduler: scheduler.clone(),
+                    purge_scheduler: purge_scheduler.clone(),
                     listener: WorkerListener::default(),
                     cache_manager: cache_manager.clone(),
+                    puffin_manager_factory: puffin_manager_factory.clone(),
                     intermediate_manager: intermediate_manager.clone(),
                     time_provider: time_provider.clone(),
+                    flush_sender: flush_sender.clone(),
+                    flush_receiver: flush_receiver.clone(),
+                    plugins: plugins.clone(),
                 }
                 .start()
             })
@@ -170,6 +194,7 @@ impl WorkerGroup {
         Ok(WorkerGroup {
             workers,
             scheduler,
+            purge_scheduler,
             cache_manager,
         })
     }
@@ -180,6 +205,8 @@ impl WorkerGroup {
 
         // Stops the scheduler gracefully.
         self.scheduler.stop(true).await?;
+        // Stops the purge scheduler gracefully.
+        self.purge_scheduler.stop(true).await?;
 
         try_join_all(self.workers.iter().map(|worker| worker.stop())).await?;
 
@@ -200,6 +227,11 @@ impl WorkerGroup {
         self.worker(region_id).is_region_exists(region_id)
     }
 
+    /// Returns true if the specific region is opening.
+    pub(crate) fn is_region_opening(&self, region_id: RegionId) -> bool {
+        self.worker(region_id).is_region_opening(region_id)
+    }
+
     /// Returns region of specific `region_id`.
     ///
     /// This method should not be public.
@@ -213,7 +245,7 @@ impl WorkerGroup {
     }
 
     /// Get worker for specific `region_id`.
-    fn worker(&self, region_id: RegionId) -> &RegionWorker {
+    pub(crate) fn worker(&self, region_id: RegionId) -> &RegionWorker {
         let index = region_id_to_index(region_id, self.workers.len());
 
         &self.workers[index]
@@ -234,19 +266,28 @@ impl WorkerGroup {
         listener: Option<crate::engine::listener::EventListenerRef>,
         time_provider: TimeProviderRef,
     ) -> Result<WorkerGroup> {
+        let (flush_sender, flush_receiver) = watch::channel(());
         let write_buffer_manager = write_buffer_manager.unwrap_or_else(|| {
-            Arc::new(WriteBufferManagerImpl::new(
-                config.global_write_buffer_size.as_bytes() as usize,
-            ))
+            Arc::new(
+                WriteBufferManagerImpl::new(config.global_write_buffer_size.as_bytes() as usize)
+                    .with_notifier(flush_sender.clone()),
+            )
         });
         let scheduler = Arc::new(LocalScheduler::new(config.max_background_jobs));
-        let intermediate_manager =
-            IntermediateManager::init_fs(&config.inverted_index.intermediate_path)
-                .await?
-                .with_buffer_size(Some(config.inverted_index.write_buffer_size.as_bytes() as _));
+        let purge_scheduler = Arc::new(LocalScheduler::new(config.max_background_jobs));
+        let puffin_manager_factory = PuffinManagerFactory::new(
+            &config.index.aux_path,
+            config.index.staging_size.as_bytes(),
+            Some(config.index.write_buffer_size.as_bytes() as _),
+        )
+        .await?;
+        let intermediate_manager = IntermediateManager::init_fs(&config.index.aux_path)
+            .await?
+            .with_buffer_size(Some(config.index.write_buffer_size.as_bytes() as _));
         let write_cache = write_cache_from_config(
             &config,
             object_store_manager.clone(),
+            puffin_manager_factory.clone(),
             intermediate_manager.clone(),
         )
         .await?;
@@ -255,6 +296,7 @@ impl WorkerGroup {
                 .sst_meta_cache_size(config.sst_meta_cache_size.as_bytes())
                 .vector_cache_size(config.vector_cache_size.as_bytes())
                 .page_cache_size(config.page_cache_size.as_bytes())
+                .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
                 .write_cache(write_cache)
                 .build(),
         );
@@ -267,10 +309,15 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     scheduler: scheduler.clone(),
+                    purge_scheduler: purge_scheduler.clone(),
                     listener: WorkerListener::new(listener.clone()),
                     cache_manager: cache_manager.clone(),
+                    puffin_manager_factory: puffin_manager_factory.clone(),
                     intermediate_manager: intermediate_manager.clone(),
                     time_provider: time_provider.clone(),
+                    flush_sender: flush_sender.clone(),
+                    flush_receiver: flush_receiver.clone(),
+                    plugins: Plugins::new(),
                 }
                 .start()
             })
@@ -279,8 +326,14 @@ impl WorkerGroup {
         Ok(WorkerGroup {
             workers,
             scheduler,
+            purge_scheduler,
             cache_manager,
         })
+    }
+
+    /// Returns the purge scheduler.
+    pub(crate) fn purge_scheduler(&self) -> &SchedulerRef {
+        &self.purge_scheduler
     }
 }
 
@@ -292,6 +345,7 @@ fn region_id_to_index(id: RegionId, num_workers: usize) -> usize {
 async fn write_cache_from_config(
     config: &MitoConfig,
     object_store_manager: ObjectStoreManagerRef,
+    puffin_manager_factory: PuffinManagerFactory,
     intermediate_manager: IntermediateManager,
 ) -> Result<Option<WriteCacheRef>> {
     if !config.enable_experimental_write_cache {
@@ -305,6 +359,8 @@ async fn write_cache_from_config(
         &config.experimental_write_cache_path,
         object_store_manager,
         config.experimental_write_cache_size,
+        config.experimental_write_cache_ttl,
+        puffin_manager_factory,
         intermediate_manager,
     )
     .await?;
@@ -325,62 +381,75 @@ struct WorkerStarter<S> {
     object_store_manager: ObjectStoreManagerRef,
     write_buffer_manager: WriteBufferManagerRef,
     scheduler: SchedulerRef,
+    purge_scheduler: SchedulerRef,
     listener: WorkerListener,
     cache_manager: CacheManagerRef,
+    puffin_manager_factory: PuffinManagerFactory,
     intermediate_manager: IntermediateManager,
     time_provider: TimeProviderRef,
+    /// Watch channel sender to notify workers to handle stalled requests.
+    flush_sender: watch::Sender<()>,
+    /// Watch channel receiver to wait for background flush job.
+    flush_receiver: watch::Receiver<()>,
+    plugins: Plugins,
 }
 
 impl<S: LogStore> WorkerStarter<S> {
     /// Starts a region worker and its background thread.
     fn start(self) -> RegionWorker {
         let regions = Arc::new(RegionMap::default());
+        let opening_regions = Arc::new(OpeningRegions::default());
         let (sender, receiver) = mpsc::channel(self.config.worker_channel_size);
 
         let running = Arc::new(AtomicBool::new(true));
-        let memtable_builder = match &self.config.memtable {
-            MemtableConfig::Experimental(merge_tree) => Arc::new(MergeTreeMemtableBuilder::new(
-                merge_tree.clone(),
-                Some(self.write_buffer_manager.clone()),
-            )) as _,
-            MemtableConfig::TimeSeries => Arc::new(TimeSeriesMemtableBuilder::new(Some(
-                self.write_buffer_manager.clone(),
-            ))) as _,
-        };
         let now = self.time_provider.current_time_millis();
+        let id_string = self.id.to_string();
         let mut worker_thread = RegionWorkerLoop {
             id: self.id,
-            config: self.config,
+            config: self.config.clone(),
             regions: regions.clone(),
             dropping_regions: Arc::new(RegionMap::default()),
+            opening_regions: opening_regions.clone(),
             sender: sender.clone(),
             receiver,
             wal: Wal::new(self.log_store),
             object_store_manager: self.object_store_manager.clone(),
             running: running.clone(),
-            memtable_builder,
-            scheduler: self.scheduler.clone(),
+            memtable_builder_provider: MemtableBuilderProvider::new(
+                Some(self.write_buffer_manager.clone()),
+                self.config.clone(),
+            ),
+            purge_scheduler: self.purge_scheduler.clone(),
             write_buffer_manager: self.write_buffer_manager,
             flush_scheduler: FlushScheduler::new(self.scheduler.clone()),
             compaction_scheduler: CompactionScheduler::new(
                 self.scheduler,
                 sender.clone(),
                 self.cache_manager.clone(),
+                self.config,
+                self.listener.clone(),
+                self.plugins.clone(),
             ),
             stalled_requests: StalledRequests::default(),
             listener: self.listener,
             cache_manager: self.cache_manager,
+            puffin_manager_factory: self.puffin_manager_factory,
             intermediate_manager: self.intermediate_manager,
             time_provider: self.time_provider,
             last_periodical_check_millis: now,
+            flush_sender: self.flush_sender,
+            flush_receiver: self.flush_receiver,
+            stalled_count: WRITE_STALL_TOTAL.with_label_values(&[&id_string]),
+            region_count: REGION_COUNT.with_label_values(&[&id_string]),
         };
-        let handle = common_runtime::spawn_write(async move {
+        let handle = common_runtime::spawn_global(async move {
             worker_thread.run().await;
         });
 
         RegionWorker {
             id: self.id,
             regions,
+            opening_regions,
             sender,
             handle: Mutex::new(Some(handle)),
             running,
@@ -394,6 +463,8 @@ pub(crate) struct RegionWorker {
     id: WorkerId,
     /// Regions bound to the worker.
     regions: RegionMapRef,
+    /// The opening regions.
+    opening_regions: OpeningRegionsRef,
     /// Request sender.
     sender: Sender<WorkerRequest>,
     /// Handle to the worker thread.
@@ -453,9 +524,20 @@ impl RegionWorker {
         self.regions.is_region_exists(region_id)
     }
 
+    /// Returns true if the region is opening.
+    fn is_region_opening(&self, region_id: RegionId) -> bool {
+        self.opening_regions.is_region_exists(region_id)
+    }
+
     /// Returns region of specific `region_id`.
     fn get_region(&self, region_id: RegionId) -> Option<MitoRegionRef> {
         self.regions.get_region(region_id)
+    }
+
+    #[cfg(test)]
+    /// Returns the [OpeningRegionsRef].
+    pub(crate) fn opening_regions(&self) -> &OpeningRegionsRef {
+        &self.opening_regions
     }
 }
 
@@ -503,6 +585,8 @@ struct RegionWorkerLoop<S> {
     regions: RegionMapRef,
     /// Regions that are not yet fully dropped.
     dropping_regions: RegionMapRef,
+    /// Regions that are opening.
+    opening_regions: OpeningRegionsRef,
     /// Request sender.
     sender: Sender<WorkerRequest>,
     /// Request receiver.
@@ -513,10 +597,10 @@ struct RegionWorkerLoop<S> {
     object_store_manager: ObjectStoreManagerRef,
     /// Whether the worker thread is still running.
     running: Arc<AtomicBool>,
-    /// Memtable builder for each region.
-    memtable_builder: MemtableBuilderRef,
-    /// Background job scheduler.
-    scheduler: SchedulerRef,
+    /// Memtable builder provider for each region.
+    memtable_builder_provider: MemtableBuilderProvider,
+    /// Background purge job scheduler.
+    purge_scheduler: SchedulerRef,
     /// Engine write buffer manager.
     write_buffer_manager: WriteBufferManagerRef,
     /// Schedules background flush requests.
@@ -529,12 +613,22 @@ struct RegionWorkerLoop<S> {
     listener: WorkerListener,
     /// Cache.
     cache_manager: CacheManagerRef,
+    /// Puffin manager factory for index.
+    puffin_manager_factory: PuffinManagerFactory,
     /// Intermediate manager for inverted index.
     intermediate_manager: IntermediateManager,
     /// Provider to get current time.
     time_provider: TimeProviderRef,
     /// Last time to check regions periodically.
     last_periodical_check_millis: i64,
+    /// Watch channel sender to notify workers to handle stalled requests.
+    flush_sender: watch::Sender<()>,
+    /// Watch channel receiver to wait for background flush job.
+    flush_receiver: watch::Receiver<()>,
+    /// Gauge of stalled request count.
+    stalled_count: IntGauge,
+    /// Gauge of regions in the worker.
+    region_count: IntGauge,
 }
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -555,15 +649,39 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             buffer.clear();
 
             let max_wait_time = self.time_provider.wait_duration(CHECK_REGION_INTERVAL);
-            match tokio::time::timeout(max_wait_time, self.receiver.recv()).await {
-                Ok(Some(request)) => buffer.push(request),
-                // The channel is disconnected.
-                Ok(None) => break,
-                Err(_) => {
+            let sleep = tokio::time::sleep(max_wait_time);
+            tokio::pin!(sleep);
+
+            tokio::select! {
+                request_opt = self.receiver.recv() => {
+                    match request_opt {
+                        Some(request) => buffer.push(request),
+                        // The channel is disconnected.
+                        None => break,
+                    }
+                }
+                recv_res = self.flush_receiver.changed() => {
+                    if recv_res.is_err() {
+                        // The channel is disconnected.
+                        break;
+                    } else {
+                        // A flush job is finished, handles stalled requests.
+                        self.handle_stalled_requests().await;
+                        continue;
+                    }
+                }
+                _ = &mut sleep => {
                     // Timeout. Checks periodical tasks.
                     self.handle_periodical_tasks();
                     continue;
                 }
+            }
+
+            if self.flush_receiver.has_changed().unwrap_or(false) {
+                // Always checks whether we could process stalled requests to avoid a request
+                // hangs too long.
+                // If the channel is closed, do nothing.
+                self.handle_stalled_requests().await;
             }
 
             // Try to recv more requests from the channel.
@@ -575,6 +693,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     Err(_) => break,
                 }
             }
+
+            self.listener.on_recv_requests(buffer.len());
 
             self.handle_requests(&mut buffer).await;
 
@@ -612,10 +732,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     edit,
                     tx,
                 } => {
-                    let result = self.edit_region(region_id, edit).await;
-                    if let Err(Err(e)) = tx.send(result) {
-                        warn!("Failed to send edit region error to caller, error: {e:?}");
-                    }
+                    self.handle_region_edit(region_id, edit, tx).await;
                 }
                 // We receive a stop signal, but we still want to process remaining
                 // requests. The worker thread will then check the running flag and
@@ -643,7 +760,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             let res = match ddl.request {
                 DdlRequest::Create(req) => self.handle_create_request(ddl.region_id, req).await,
                 DdlRequest::Drop(_) => self.handle_drop_request(ddl.region_id).await,
-                DdlRequest::Open(req) => self.handle_open_request(ddl.region_id, req).await,
+                DdlRequest::Open((req, wal_entry_receiver)) => {
+                    self.handle_open_request(ddl.region_id, req, wal_entry_receiver, ddl.sender)
+                        .await;
+                    continue;
+                }
                 DdlRequest::Close(_) => self.handle_close_request(ddl.region_id).await,
                 DdlRequest::Alter(req) => {
                     self.handle_alter_request(ddl.region_id, req, ddl.sender)
@@ -655,11 +776,16 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         .await;
                     continue;
                 }
-                DdlRequest::Compact(_) => {
-                    self.handle_compaction_request(ddl.region_id, ddl.sender);
+                DdlRequest::Compact(req) => {
+                    self.handle_compaction_request(ddl.region_id, req, ddl.sender)
+                        .await;
                     continue;
                 }
-                DdlRequest::Truncate(_) => self.handle_truncate_request(ddl.region_id).await,
+                DdlRequest::Truncate(_) => {
+                    self.handle_truncate_request(ddl.region_id, ddl.sender)
+                        .await;
+                    continue;
+                }
                 DdlRequest::Catchup(req) => self.handle_catchup_request(ddl.region_id, req).await,
             };
 
@@ -696,6 +822,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 self.handle_compaction_finished(region_id, req).await
             }
             BackgroundNotify::CompactionFailed(req) => self.handle_compaction_failure(req).await,
+            BackgroundNotify::Truncate(req) => self.handle_truncate_result(req).await,
+            BackgroundNotify::RegionChange(req) => self.handle_manifest_region_change_result(req),
+            BackgroundNotify::RegionEdit(req) => self.handle_region_edit_result(req),
         }
     }
 
@@ -706,49 +835,38 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         sender: oneshot::Sender<SetReadonlyResponse>,
     ) {
         if let Some(region) = self.regions.get_region(region_id) {
-            region.set_writable(false);
+            // We need to do this in background as we need the manifest lock.
+            common_runtime::spawn_global(async move {
+                region.set_readonly_gracefully().await;
 
-            let last_entry_id = region.version_control.current().last_entry_id;
-            let _ = sender.send(SetReadonlyResponse::success(Some(last_entry_id)));
+                let last_entry_id = region.version_control.current().last_entry_id;
+                let _ = sender.send(SetReadonlyResponse::success(Some(last_entry_id)));
+            });
         } else {
             let _ = sender.send(SetReadonlyResponse::NotFound);
         }
     }
-
-    async fn edit_region(&self, region_id: RegionId, edit: RegionEdit) -> Result<()> {
-        let region = self.regions.writable_region(region_id)?;
-
-        for file_meta in &edit.files_to_add {
-            let is_exist = region.access_layer.is_exist(file_meta).await?;
-            ensure!(
-                is_exist,
-                InvalidRequestSnafu {
-                    region_id,
-                    reason: format!(
-                        "trying to add a not exist file '{}' when editing region",
-                        file_meta.file_id
-                    )
-                }
-            );
-        }
-
-        // Applying region edit directly has nothing to do with memtables (at least for now).
-        region.apply_edit(edit, &[]).await
-    }
 }
 
 impl<S> RegionWorkerLoop<S> {
-    // Clean up the worker.
+    /// Cleans up the worker.
     async fn clean(&self) {
         // Closes remaining regions.
         let regions = self.regions.list_regions();
         for region in regions {
-            if let Err(e) = region.stop().await {
-                error!(e; "Failed to stop region {}", region.region_id);
-            }
+            region.stop().await;
         }
 
         self.regions.clear();
+    }
+
+    /// Notifies the whole group that a flush job is finished so other
+    /// workers can handle stalled requests.
+    fn notify_group(&mut self) {
+        // Notifies all receivers.
+        let _ = self.flush_sender.send(());
+        // Marks the receiver in current worker as seen so the loop won't be waked up immediately.
+        self.flush_receiver.borrow_and_update();
     }
 }
 
@@ -813,6 +931,24 @@ impl WorkerListener {
         // Avoid compiler warning.
         let _ = region_id;
         let _ = removed;
+    }
+
+    pub(crate) async fn on_merge_ssts_finished(&self, region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_merge_ssts_finished(region_id).await;
+        }
+        // Avoid compiler warning.
+        let _ = region_id;
+    }
+
+    pub(crate) fn on_recv_requests(&self, request_num: usize) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_recv_requests(request_num);
+        }
+        // Avoid compiler warning.
+        let _ = request_num;
     }
 }
 

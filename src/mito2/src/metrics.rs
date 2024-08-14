@@ -19,10 +19,13 @@ use prometheus::*;
 pub const STAGE_LABEL: &str = "stage";
 /// Type label.
 pub const TYPE_LABEL: &str = "type";
+const CACHE_EVICTION_CAUSE: &str = "cause";
 /// Reason to flush.
 pub const FLUSH_REASON: &str = "reason";
 /// File type label.
 pub const FILE_TYPE_LABEL: &str = "file_type";
+/// Region worker id label.
+pub const WORKER_LABEL: &str = "worker";
 
 lazy_static! {
     /// Global write buffer size in bytes.
@@ -31,9 +34,13 @@ lazy_static! {
     /// Global memtable dictionary size in bytes.
     pub static ref MEMTABLE_DICT_BYTES: IntGauge =
         register_int_gauge!("greptime_mito_memtable_dict_bytes", "mito memtable dictionary size in bytes").unwrap();
-    /// Gauge for open regions
-    pub static ref REGION_COUNT: IntGauge =
-        register_int_gauge!("greptime_mito_region_count", "mito region count").unwrap();
+    /// Gauge for open regions in each worker.
+    pub static ref REGION_COUNT: IntGaugeVec =
+        register_int_gauge_vec!(
+            "greptime_mito_region_count",
+            "mito region count in each worker",
+            &[WORKER_LABEL],
+        ).unwrap();
     /// Elapsed time to handle requests.
     pub static ref HANDLE_REQUEST_ELAPSED: HistogramVec = register_histogram_vec!(
             "greptime_mito_handle_request_elapsed",
@@ -70,9 +77,12 @@ lazy_static! {
 
 
     // ------ Write related metrics
-    /// Counter of stalled write requests.
-    pub static ref WRITE_STALL_TOTAL: IntCounter =
-        register_int_counter!("greptime_mito_write_stall_total", "mito write stall total").unwrap();
+    /// Number of stalled write requests in each worker.
+    pub static ref WRITE_STALL_TOTAL: IntGaugeVec = register_int_gauge_vec!(
+            "greptime_mito_write_stall_total",
+            "mito stalled write request in each worker",
+            &[WORKER_LABEL]
+        ).unwrap();
     /// Counter of rejected write requests.
     pub static ref WRITE_REJECT_TOTAL: IntCounter =
         register_int_counter!("greptime_mito_write_reject_total", "mito write reject total").unwrap();
@@ -185,13 +195,20 @@ lazy_static! {
         "mito upload bytes total",
     )
     .unwrap();
+    /// Cache eviction counter, labeled with cache type and eviction reason.
+    pub static ref CACHE_EVICTION: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_cache_eviction",
+        "mito cache eviction",
+        &[TYPE_LABEL, CACHE_EVICTION_CAUSE]
+    ).unwrap();
     // ------- End of cache metrics.
 
     // Index metrics.
     /// Timer of index application.
-    pub static ref INDEX_APPLY_ELAPSED: Histogram = register_histogram!(
+    pub static ref INDEX_APPLY_ELAPSED: HistogramVec = register_histogram_vec!(
         "greptime_index_apply_elapsed",
         "index apply elapsed",
+        &[TYPE_LABEL],
     )
     .unwrap();
     /// Gauge of index apply memory usage.
@@ -204,26 +221,29 @@ lazy_static! {
     pub static ref INDEX_CREATE_ELAPSED: HistogramVec = register_histogram_vec!(
         "greptime_index_create_elapsed",
         "index create elapsed",
-        &[STAGE_LABEL],
+        &[STAGE_LABEL, TYPE_LABEL],
         vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0, 300.0]
     )
     .unwrap();
     /// Counter of rows indexed.
-    pub static ref INDEX_CREATE_ROWS_TOTAL: IntCounter = register_int_counter!(
+    pub static ref INDEX_CREATE_ROWS_TOTAL: IntCounterVec = register_int_counter_vec!(
         "greptime_index_create_rows_total",
         "index create rows total",
+        &[TYPE_LABEL],
     )
     .unwrap();
     /// Counter of created index bytes.
-    pub static ref INDEX_CREATE_BYTES_TOTAL: IntCounter = register_int_counter!(
+    pub static ref INDEX_CREATE_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
         "greptime_index_create_bytes_total",
         "index create bytes total",
+        &[TYPE_LABEL],
     )
     .unwrap();
     /// Gauge of index create memory usage.
-    pub static ref INDEX_CREATE_MEMORY_USAGE: IntGauge = register_int_gauge!(
+    pub static ref INDEX_CREATE_MEMORY_USAGE: IntGaugeVec = register_int_gauge_vec!(
         "greptime_index_create_memory_usage",
         "index create memory usage",
+        &[TYPE_LABEL],
     ).unwrap();
     /// Counter of r/w bytes on index related IO operations.
     pub static ref INDEX_IO_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
@@ -278,23 +298,33 @@ lazy_static! {
         .with_label_values(&["flush", "intermediate"]);
     // ------- End of index metrics.
 
-    /// Merge tree memtable data buffer freeze metrics
-    pub static ref MERGE_TREE_DATA_BUFFER_FREEZE_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(
-        "greptime_merge_tree_buffer_freeze_stage_elapsed",
-        "mito merge tree data buffer freeze stage elapsed",
+    /// Partition tree memtable data buffer freeze metrics
+    pub static ref PARTITION_TREE_DATA_BUFFER_FREEZE_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_partition_tree_buffer_freeze_stage_elapsed",
+        "mito partition tree data buffer freeze stage elapsed",
         &[STAGE_LABEL],
         vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0]
     )
     .unwrap();
 
-    /// Merge tree memtable read path metrics
-    pub static ref MERGE_TREE_READ_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(
-        "greptime_merge_tree_read_stage_elapsed",
-        "mito merge tree read stage elapsed",
+    /// Partition tree memtable read path metrics
+    pub static ref PARTITION_TREE_READ_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_partition_tree_read_stage_elapsed",
+        "mito partition tree read stage elapsed",
         &[STAGE_LABEL],
         vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0]
     )
     .unwrap();
 
-    // ------- End of merge tree memtable metrics.
+    // ------- End of partition tree memtable metrics.
+
+
+    // Manifest related metrics:
+
+    /// Elapsed time of manifest operation. Labeled with "op".
+    pub static ref MANIFEST_OP_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_manifest_op_elapsed",
+        "mito manifest operation elapsed",
+        &["op"]
+    ).unwrap();
 }

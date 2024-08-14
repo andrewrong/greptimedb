@@ -32,6 +32,7 @@ mod tests {
     use frontend::instance::Instance;
     use query::parser::QueryLanguageParser;
     use query::plan::LogicalPlan;
+    use query::query_engine::DefaultSerializer;
     use servers::interceptor::{SqlQueryInterceptor, SqlQueryInterceptorRef};
     use servers::query_handler::sql::SqlQueryHandler;
     use session::context::{QueryContext, QueryContextRef};
@@ -180,14 +181,14 @@ mod tests {
         let batches = common_recordbatch::util::collect_batches(s).await.unwrap();
         let pretty_print = batches.pretty_print().unwrap();
         let expected = "\
-+-------+---------------------+-------------+-----------+-----------+
-| host  | ts                  | cpu         | memory    | disk_util |
-+-------+---------------------+-------------+-----------+-----------+
-| 490   | 2013-12-31T16:00:00 | 0.1         | 1.0       | 9.9       |
-| 550-A | 2022-12-31T16:00:00 | 1.0         | 100.0     | 9.9       |
-| 550-W | 2023-12-31T16:00:00 | 10000.0     | 1000000.0 | 9.9       |
-| MOSS  | 2043-12-31T16:00:00 | 100000000.0 | 1.0e10    | 9.9       |
-+-------+---------------------+-------------+-----------+-----------+";
++-------+---------------------+-------------+---------------+-----------+
+| host  | ts                  | cpu         | memory        | disk_util |
++-------+---------------------+-------------+---------------+-----------+
+| 490   | 2013-12-31T16:00:00 | 0.1         | 1.0           | 9.9       |
+| 550-A | 2022-12-31T16:00:00 | 1.0         | 100.0         | 9.9       |
+| 550-W | 2023-12-31T16:00:00 | 10000.0     | 1000000.0     | 9.9       |
+| MOSS  | 2043-12-31T16:00:00 | 100000000.0 | 10000000000.0 | 9.9       |
++-------+---------------------+-------------+---------------+-----------+";
         assert_eq!(pretty_print, expected);
     }
 
@@ -238,7 +239,9 @@ mod tests {
             .plan(stmt, QueryContext::arc())
             .await
             .unwrap();
-        let plan = DFLogicalSubstraitConvertor.encode(&plan).unwrap();
+        let plan = DFLogicalSubstraitConvertor
+            .encode(&plan, DefaultSerializer)
+            .unwrap();
 
         for (region, dn) in region_to_dn_map.iter() {
             let region_server = instance.datanodes().get(dn).unwrap().region_server();
@@ -246,7 +249,7 @@ mod tests {
             let region_id = RegionId::new(table_id, *region);
 
             let stream = region_server
-                .handle_read(QueryRequest {
+                .handle_remote_read(QueryRequest {
                     region_id: region_id.as_u64(),
                     plan: plan.to_vec(),
                     ..Default::default()
@@ -357,7 +360,7 @@ mod tests {
                             disk_util DOUBLE DEFAULT 9.9,
                             TIME INDEX (ts),
                             PRIMARY KEY(host)
-                        ) engine=mito with(regions=1);"#;
+                        ) engine=mito;"#;
         let output = SqlQueryHandler::do_query(&*instance, sql, QueryContext::arc())
             .await
             .remove(0)
@@ -419,7 +422,7 @@ mod tests {
                             disk_util DOUBLE DEFAULT 9.9,
                             TIME INDEX (ts),
                             PRIMARY KEY(host)
-                        ) engine=mito with(regions=1);"#;
+                        ) engine=mito;"#;
         let output = SqlQueryHandler::do_query(&*instance, sql, query_ctx.clone())
             .await
             .remove(0)

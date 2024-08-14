@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_telemetry::logging::info;
+use common_base::secrets::ExposeSecret;
+use common_telemetry::info;
 use object_store::services::Oss;
 use object_store::{util, ObjectStore};
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 
 use crate::config::OssConfig;
@@ -29,8 +29,7 @@ pub(crate) async fn new_oss_object_store(oss_config: &OssConfig) -> Result<Objec
         oss_config.bucket, &root
     );
 
-    let mut builder = Oss::default();
-    let _ = builder
+    let builder = Oss::default()
         .root(&root)
         .bucket(&oss_config.bucket)
         .endpoint(&oss_config.endpoint)

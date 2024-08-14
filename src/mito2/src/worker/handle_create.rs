@@ -24,7 +24,6 @@ use store_api::region_request::{AffectedRows, RegionCreateRequest};
 use store_api::storage::RegionId;
 
 use crate::error::{InvalidMetadataSnafu, Result};
-use crate::metrics::REGION_COUNT;
 use crate::region::opener::{check_recovered_region, RegionOpener};
 use crate::worker::RegionWorkerLoop;
 
@@ -58,9 +57,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let region = RegionOpener::new(
             region_id,
             &request.region_dir,
-            self.memtable_builder.clone(),
+            self.memtable_builder_provider.clone(),
             self.object_store_manager.clone(),
-            self.scheduler.clone(),
+            self.purge_scheduler.clone(),
+            self.puffin_manager_factory.clone(),
             self.intermediate_manager.clone(),
         )
         .metadata(metadata)
@@ -69,9 +69,13 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         .create_or_open(&self.config, &self.wal)
         .await?;
 
-        info!("A new region created, region: {:?}", region.metadata());
+        info!(
+            "A new region created, worker: {}, region: {:?}",
+            self.id,
+            region.metadata()
+        );
 
-        REGION_COUNT.inc();
+        self.region_count.inc();
 
         // Insert the MitoRegion into the RegionMap.
         self.regions.insert_region(Arc::new(region));

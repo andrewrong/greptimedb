@@ -14,74 +14,47 @@
 
 //! Implementation of `SHOW CREATE TABLE` statement.
 
-use std::fmt::Display;
+use std::collections::HashMap;
 
 use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, SchemaRef, COMMENT_KEY};
 use humantime::format_duration;
 use snafu::ResultExt;
 use sql::ast::{
-    ColumnDef, ColumnOption, ColumnOptionDef, Expr, Ident, ObjectName, SqlOption, TableConstraint,
-    Value as SqlValue,
+    ColumnDef, ColumnOption, ColumnOptionDef, Expr, Ident, ObjectName, TableConstraint,
 };
 use sql::dialect::GreptimeDbDialect;
 use sql::parser::ParserContext;
-use sql::statements::create::{CreateTable, TIME_INDEX};
-use sql::statements::{self};
+use sql::statements::create::{Column, ColumnExtensions, CreateTable, TIME_INDEX};
+use sql::statements::{self, OptionMap};
+use sql::{COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE};
+use sqlparser::ast::KeyOrIndexDisplay;
+use store_api::metric_engine_consts::{is_metric_engine, is_metric_engine_internal_column};
 use table::metadata::{TableInfoRef, TableMeta};
-use table::requests::FILE_TABLE_META_KEY;
+use table::requests::{FILE_TABLE_META_KEY, TTL_KEY, WRITE_BUFFER_SIZE_KEY};
 
-use crate::error::{ConvertSqlTypeSnafu, ConvertSqlValueSnafu, Result, SqlSnafu};
+use crate::error::{
+    ConvertSqlTypeSnafu, ConvertSqlValueSnafu, GetFulltextOptionsSnafu, Result, SqlSnafu,
+};
 
-#[inline]
-fn number_value<T: Display>(n: T) -> SqlValue {
-    SqlValue::Number(format!("{}", n), false)
-}
-
-#[inline]
-fn string_value(s: impl Into<String>) -> SqlValue {
-    SqlValue::SingleQuotedString(s.into())
-}
-
-#[inline]
-fn sql_option(name: &str, value: SqlValue) -> SqlOption {
-    SqlOption {
-        name: name.into(),
-        value,
-    }
-}
-
-fn create_sql_options(table_meta: &TableMeta) -> Vec<SqlOption> {
+fn create_sql_options(table_meta: &TableMeta) -> OptionMap {
     let table_opts = &table_meta.options;
-    let mut options = Vec::with_capacity(4 + table_opts.extra_options.len());
-
-    if !table_meta.region_numbers.is_empty() {
-        options.push(sql_option(
-            "regions",
-            number_value(table_meta.region_numbers.len()),
-        ));
-    }
-
+    let mut options = OptionMap::default();
     if let Some(write_buffer_size) = table_opts.write_buffer_size {
-        options.push(sql_option(
-            "write_buffer_size",
-            string_value(write_buffer_size.to_string()),
-        ));
+        options.insert(
+            WRITE_BUFFER_SIZE_KEY.to_string(),
+            write_buffer_size.to_string(),
+        );
     }
     if let Some(ttl) = table_opts.ttl {
-        options.push(sql_option(
-            "ttl",
-            string_value(format_duration(ttl).to_string()),
-        ));
+        options.insert(TTL_KEY.to_string(), format_duration(ttl).to_string());
     }
-
     for (k, v) in table_opts
         .extra_options
         .iter()
         .filter(|(k, _)| k != &FILE_TABLE_META_KEY)
     {
-        options.push(sql_option(k, string_value(v)));
+        options.insert(k.to_string(), v.to_string());
     }
-
     options
 }
 
@@ -90,9 +63,10 @@ fn column_option_def(option: ColumnOption) -> ColumnOptionDef {
     ColumnOptionDef { name: None, option }
 }
 
-fn create_column_def(column_schema: &ColumnSchema, quote_style: char) -> Result<ColumnDef> {
+fn create_column(column_schema: &ColumnSchema, quote_style: char) -> Result<Column> {
     let name = &column_schema.name;
     let mut options = Vec::with_capacity(2);
+    let mut extensions = ColumnExtensions::default();
 
     if column_schema.is_nullable() {
         options.push(column_option_def(ColumnOption::Null));
@@ -118,18 +92,40 @@ fn create_column_def(column_schema: &ColumnSchema, quote_style: char) -> Result<
         options.push(column_option_def(ColumnOption::Comment(c.to_string())));
     }
 
-    Ok(ColumnDef {
-        name: Ident::with_quote(quote_style, name),
-        data_type: statements::concrete_data_type_to_sql_data_type(&column_schema.data_type)
-            .with_context(|_| ConvertSqlTypeSnafu {
-                datatype: column_schema.data_type.clone(),
-            })?,
-        collation: None,
-        options,
+    if let Some(opt) = column_schema
+        .fulltext_options()
+        .context(GetFulltextOptionsSnafu)?
+        && opt.enable
+    {
+        let map = HashMap::from([
+            (
+                COLUMN_FULLTEXT_OPT_KEY_ANALYZER.to_string(),
+                opt.analyzer.to_string(),
+            ),
+            (
+                COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE.to_string(),
+                opt.case_sensitive.to_string(),
+            ),
+        ]);
+        extensions.fulltext_options = Some(map.into());
+    }
+
+    Ok(Column {
+        column_def: ColumnDef {
+            name: Ident::with_quote(quote_style, name),
+            data_type: statements::concrete_data_type_to_sql_data_type(&column_schema.data_type)
+                .with_context(|_| ConvertSqlTypeSnafu {
+                    datatype: column_schema.data_type.clone(),
+                })?,
+            collation: None,
+            options,
+        },
+        extensions,
     })
 }
 
 fn create_table_constraints(
+    engine: &str,
     schema: &SchemaRef,
     table_meta: &TableMeta,
     quote_style: char,
@@ -140,18 +136,32 @@ fn create_table_constraints(
         constraints.push(TableConstraint::Unique {
             name: Some(TIME_INDEX.into()),
             columns: vec![Ident::with_quote(quote_style, column_name)],
-            is_primary: false,
+            characteristics: None,
+            index_name: None,
+            index_type_display: KeyOrIndexDisplay::None,
+            index_type: None,
+            index_options: vec![],
         });
     }
     if !table_meta.primary_key_indices.is_empty() {
+        let is_metric_engine = is_metric_engine(engine);
         let columns = table_meta
             .row_key_column_names()
-            .map(|name| Ident::with_quote(quote_style, name))
+            .flat_map(|name| {
+                if is_metric_engine && is_metric_engine_internal_column(name) {
+                    None
+                } else {
+                    Some(Ident::with_quote(quote_style, name))
+                }
+            })
             .collect();
-        constraints.push(TableConstraint::Unique {
+        constraints.push(TableConstraint::PrimaryKey {
             name: None,
             columns,
-            is_primary: true,
+            characteristics: None,
+            index_name: None,
+            index_type: None,
+            index_options: vec![],
         });
     }
 
@@ -163,14 +173,20 @@ pub fn create_table_stmt(table_info: &TableInfoRef, quote_style: char) -> Result
     let table_meta = &table_info.meta;
     let table_name = &table_info.name;
     let schema = &table_info.meta.schema;
-
+    let is_metric_engine = is_metric_engine(&table_meta.engine);
     let columns = schema
         .column_schemas()
         .iter()
-        .map(|c| create_column_def(c, quote_style))
+        .filter_map(|c| {
+            if is_metric_engine && is_metric_engine_internal_column(&c.name) {
+                None
+            } else {
+                Some(create_column(c, quote_style))
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
 
-    let constraints = create_table_constraints(schema, table_meta, quote_style);
+    let constraints = create_table_constraints(&table_meta.engine, schema, table_meta, quote_style);
 
     Ok(CreateTable {
         if_not_exists: true,
@@ -190,7 +206,7 @@ mod tests {
 
     use common_time::timestamp::TimeUnit;
     use datatypes::prelude::ConcreteDataType;
-    use datatypes::schema::{Schema, SchemaRef};
+    use datatypes::schema::{FulltextOptions, Schema, SchemaRef};
     use table::metadata::*;
     use table::requests::{
         TableOptions, FILE_TABLE_FORMAT_KEY, FILE_TABLE_LOCATION_KEY, FILE_TABLE_META_KEY,
@@ -205,6 +221,12 @@ mod tests {
             ColumnSchema::new("host", ConcreteDataType::string_datatype(), true),
             ColumnSchema::new("cpu", ConcreteDataType::float64_datatype(), true),
             ColumnSchema::new("disk", ConcreteDataType::float32_datatype(), true),
+            ColumnSchema::new("msg", ConcreteDataType::string_datatype(), true)
+                .with_fulltext_options(FulltextOptions {
+                    enable: true,
+                    ..Default::default()
+                })
+                .unwrap(),
             ColumnSchema::new(
                 "ts",
                 ConcreteDataType::timestamp_datatype(TimeUnit::Millisecond),
@@ -216,6 +238,7 @@ mod tests {
             .unwrap()
             .with_time_index(true),
         ];
+
         let table_schema = SchemaRef::new(Schema::new(schema));
         let table_name = "system_metrics";
         let schema_name = "public".to_string();
@@ -258,14 +281,13 @@ CREATE TABLE IF NOT EXISTS "system_metrics" (
   "host" STRING NULL,
   "cpu" DOUBLE NULL,
   "disk" FLOAT NULL,
+  "msg" STRING NULL FULLTEXT WITH(analyzer = 'English', case_sensitive = 'false'),
   "ts" TIMESTAMP(3) NOT NULL DEFAULT current_timestamp(),
   TIME INDEX ("ts"),
   PRIMARY KEY ("id", "host")
 )
 ENGINE=mito
-WITH(
-  regions = 3
-)"#,
+"#,
             sql
         );
     }

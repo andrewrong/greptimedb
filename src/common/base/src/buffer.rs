@@ -33,16 +33,21 @@ pub enum Error {
     Overflow {
         src_len: usize,
         dst_len: usize,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Buffer underflow"))]
-    Underflow { location: Location },
+    Underflow {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("IO operation reach EOF"))]
     Eof {
         #[snafu(source)]
         error: std::io::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 }
@@ -52,14 +57,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorExt for Error {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn location_opt(&self) -> Option<common_error::snafu::Location> {
-        match self {
-            Error::Overflow { location, .. } => Some(*location),
-            Error::Underflow { location, .. } => Some(*location),
-            Error::Eof { location, .. } => Some(*location),
-        }
     }
 }
 

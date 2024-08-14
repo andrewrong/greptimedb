@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod bytea;
+mod datetime;
+mod error;
 mod interval;
 
 use std::collections::HashMap;
@@ -26,11 +29,16 @@ use datatypes::types::TimestampType;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::results::{DataRowEncoder, FieldInfo};
 use pgwire::api::Type;
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::error::{PgWireError, PgWireResult};
 use query::plan::LogicalPlan;
+use session::context::QueryContextRef;
+use session::session_config::PGByteaOutputValue;
 
+use self::bytea::{EscapeOutputBytea, HexOutputBytea};
+use self::datetime::{StylingDate, StylingDateTime};
+pub use self::error::PgErrorCode;
 use self::interval::PgInterval;
-use crate::error::{self, Error, Result};
+use crate::error::{self as server_error, Error, Result};
 use crate::SqlPlan;
 
 pub(super) fn schema_to_pg(origin: &Schema, field_formats: &Format) -> Result<Vec<FieldInfo>> {
@@ -50,7 +58,11 @@ pub(super) fn schema_to_pg(origin: &Schema, field_formats: &Format) -> Result<Ve
         .collect::<Result<Vec<FieldInfo>>>()
 }
 
-pub(super) fn encode_value(value: &Value, builder: &mut DataRowEncoder) -> PgWireResult<()> {
+pub(super) fn encode_value(
+    query_ctx: &QueryContextRef,
+    value: &Value,
+    builder: &mut DataRowEncoder,
+) -> PgWireResult<()> {
     match value {
         Value::Null => builder.encode_field(&None::<&i8>),
         Value::Boolean(v) => builder.encode_field(v),
@@ -65,10 +77,17 @@ pub(super) fn encode_value(value: &Value, builder: &mut DataRowEncoder) -> PgWir
         Value::Float32(v) => builder.encode_field(&v.0),
         Value::Float64(v) => builder.encode_field(&v.0),
         Value::String(v) => builder.encode_field(&v.as_utf8()),
-        Value::Binary(v) => builder.encode_field(&v.deref()),
+        Value::Binary(v) => {
+            let bytea_output = query_ctx.configuration_parameter().postgres_bytea_output();
+            match *bytea_output {
+                PGByteaOutputValue::ESCAPE => builder.encode_field(&EscapeOutputBytea(v.deref())),
+                PGByteaOutputValue::HEX => builder.encode_field(&HexOutputBytea(v.deref())),
+            }
+        }
         Value::Date(v) => {
             if let Some(date) = v.to_chrono_date() {
-                builder.encode_field(&date)
+                let (style, order) = *query_ctx.configuration_parameter().pg_datetime_style();
+                builder.encode_field(&StylingDate(&date, style, order))
             } else {
                 Err(PgWireError::ApiError(Box::new(Error::Internal {
                     err_msg: format!("Failed to convert date to postgres type {v:?}",),
@@ -77,7 +96,8 @@ pub(super) fn encode_value(value: &Value, builder: &mut DataRowEncoder) -> PgWir
         }
         Value::DateTime(v) => {
             if let Some(datetime) = v.to_chrono_datetime() {
-                builder.encode_field(&datetime)
+                let (style, order) = *query_ctx.configuration_parameter().pg_datetime_style();
+                builder.encode_field(&StylingDateTime(&datetime, style, order))
             } else {
                 Err(PgWireError::ApiError(Box::new(Error::Internal {
                     err_msg: format!("Failed to convert date to postgres type {v:?}",),
@@ -86,7 +106,8 @@ pub(super) fn encode_value(value: &Value, builder: &mut DataRowEncoder) -> PgWir
         }
         Value::Timestamp(v) => {
             if let Some(datetime) = v.to_chrono_datetime() {
-                builder.encode_field(&datetime)
+                let (style, order) = *query_ctx.configuration_parameter().pg_datetime_style();
+                builder.encode_field(&StylingDateTime(&datetime, style, order))
             } else {
                 Err(PgWireError::ApiError(Box::new(Error::Internal {
                     err_msg: format!("Failed to convert date to postgres type {v:?}",),
@@ -135,7 +156,7 @@ pub(super) fn type_gt_to_pg(origin: &ConcreteDataType) -> Result<Type> {
         &ConcreteDataType::Decimal128(_) => Ok(Type::NUMERIC),
         &ConcreteDataType::Duration(_)
         | &ConcreteDataType::List(_)
-        | &ConcreteDataType::Dictionary(_) => error::UnsupportedDataTypeSnafu {
+        | &ConcreteDataType::Dictionary(_) => server_error::UnsupportedDataTypeSnafu {
             data_type: origin,
             reason: "not implemented",
         }
@@ -158,7 +179,7 @@ pub(super) fn type_pg_to_gt(origin: &Type) -> Result<ConcreteDataType> {
         )),
         &Type::DATE => Ok(ConcreteDataType::date_datatype()),
         &Type::TIME => Ok(ConcreteDataType::datetime_datatype()),
-        _ => error::InternalSnafu {
+        _ => server_error::InternalSnafu {
             err_msg: format!("unimplemented datatype {origin:?}"),
         }
         .fail(),
@@ -217,7 +238,7 @@ pub(super) fn parameter_to_string(portal: &Portal<SqlPlan>, idx: usize) -> PgWir
 }
 
 pub(super) fn invalid_parameter_error(msg: &str, detail: Option<&str>) -> PgWireError {
-    let mut error_info = ErrorInfo::new("ERROR".to_owned(), "22023".to_owned(), msg.to_owned());
+    let mut error_info = PgErrorCode::Ec22023.to_err_info(msg.to_string());
     error_info.detail = detail.map(|s| s.to_owned());
     PgWireError::UserError(Box::new(error_info))
 }
@@ -445,24 +466,25 @@ pub(super) fn parameters_to_scalar_values(
                 let data = portal.parameter::<NaiveDateTime>(idx, &client_type)?;
                 match server_type {
                     ConcreteDataType::Timestamp(unit) => match *unit {
-                        TimestampType::Second(_) => {
-                            ScalarValue::TimestampSecond(data.map(|ts| ts.timestamp()), None)
-                        }
+                        TimestampType::Second(_) => ScalarValue::TimestampSecond(
+                            data.map(|ts| ts.and_utc().timestamp()),
+                            None,
+                        ),
                         TimestampType::Millisecond(_) => ScalarValue::TimestampMillisecond(
-                            data.map(|ts| ts.timestamp_millis()),
+                            data.map(|ts| ts.and_utc().timestamp_millis()),
                             None,
                         ),
                         TimestampType::Microsecond(_) => ScalarValue::TimestampMicrosecond(
-                            data.map(|ts| ts.timestamp_micros()),
+                            data.map(|ts| ts.and_utc().timestamp_micros()),
                             None,
                         ),
                         TimestampType::Nanosecond(_) => ScalarValue::TimestampNanosecond(
-                            data.map(|ts| ts.timestamp_micros()),
+                            data.map(|ts| ts.and_utc().timestamp_micros()),
                             None,
                         ),
                     },
                     ConcreteDataType::DateTime(_) => {
-                        ScalarValue::Date64(data.map(|d| d.timestamp_millis()))
+                        ScalarValue::Date64(data.map(|d| d.and_utc().timestamp_millis()))
                     }
                     _ => {
                         return Err(invalid_parameter_error(
@@ -563,6 +585,7 @@ mod test {
     use datatypes::value::ListValue;
     use pgwire::api::results::{FieldFormat, FieldInfo};
     use pgwire::api::Type;
+    use session::context::QueryContextBuilder;
 
     use super::*;
 
@@ -784,16 +807,18 @@ mod test {
             Value::Timestamp(1000001i64.into()),
             Value::Interval(1000001i128.into()),
         ];
+        let query_context = QueryContextBuilder::default()
+            .configuration_parameter(Default::default())
+            .build()
+            .into();
         let mut builder = DataRowEncoder::new(Arc::new(schema));
         for i in values.iter() {
-            encode_value(i, &mut builder).unwrap();
+            encode_value(&query_context, i, &mut builder).unwrap();
         }
 
         let err = encode_value(
-            &Value::List(ListValue::new(
-                Some(Box::default()),
-                ConcreteDataType::int16_datatype(),
-            )),
+            &query_context,
+            &Value::List(ListValue::new(vec![], ConcreteDataType::int16_datatype())),
             &mut builder,
         )
         .unwrap_err();
@@ -804,6 +829,20 @@ mod test {
             _ => {
                 unreachable!()
             }
+        }
+    }
+
+    #[test]
+    fn test_invalid_parameter() {
+        // test for refactor with PgErrorCode
+        let msg = "invalid_parameter_count";
+        let error = invalid_parameter_error(msg, None);
+        if let PgWireError::UserError(value) = error {
+            assert_eq!("ERROR", value.severity);
+            assert_eq!("22023", value.code);
+            assert_eq!(msg, value.message);
+        } else {
+            panic!("test_invalid_parameter failed");
         }
     }
 }

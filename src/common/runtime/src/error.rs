@@ -29,17 +29,23 @@ pub enum Error {
     BuildRuntime {
         #[snafu(source)]
         error: std::io::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Repeated task {} is already started", name))]
-    IllegalState { name: String, location: Location },
+    IllegalState {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to wait for repeated task {} to stop", name))]
     WaitGcTaskStop {
         name: String,
         #[snafu(source)]
         error: JoinError,
+        #[snafu(implicit)]
         location: Location,
     },
 }
@@ -47,13 +53,5 @@ pub enum Error {
 impl ErrorExt for Error {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn location_opt(&self) -> Option<common_error::snafu::Location> {
-        match self {
-            Error::BuildRuntime { location, .. }
-            | Error::IllegalState { location, .. }
-            | Error::WaitGcTaskStop { location, .. } => Some(*location),
-        }
     }
 }

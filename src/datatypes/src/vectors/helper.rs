@@ -26,9 +26,9 @@ use datafusion_common::ScalarValue;
 use snafu::{OptionExt, ResultExt};
 
 use crate::data_type::ConcreteDataType;
-use crate::error::{self, Result};
+use crate::error::{self, ConvertArrowArrayToScalarsSnafu, Result};
 use crate::scalars::{Scalar, ScalarVectorBuilder};
-use crate::value::{ListValue, ListValueRef};
+use crate::value::{ListValue, ListValueRef, Value};
 use crate::vectors::{
     BinaryVector, BooleanVector, ConstantVector, DateTimeVector, DateVector, Decimal128Vector,
     DurationMicrosecondVector, DurationMillisecondVector, DurationNanosecondVector,
@@ -160,19 +160,18 @@ impl Helper {
             | ScalarValue::FixedSizeBinary(_, v) => {
                 ConstantVector::new(Arc::new(BinaryVector::from(vec![v])), length)
             }
-            ScalarValue::List(v, field) | ScalarValue::Fixedsizelist(v, field, _) => {
-                let item_type = ConcreteDataType::try_from(field.data_type())?;
+            ScalarValue::List(array) => {
+                let item_type = ConcreteDataType::try_from(&array.value_type())?;
                 let mut builder = ListVectorBuilder::with_type_capacity(item_type.clone(), 1);
-                if let Some(values) = v {
-                    let values = values
-                        .into_iter()
-                        .map(ScalarValue::try_into)
-                        .collect::<Result<_>>()?;
-                    let list_value = ListValue::new(Some(Box::new(values)), item_type);
-                    builder.push(Some(ListValueRef::Ref { val: &list_value }));
-                } else {
-                    builder.push(None);
-                }
+                let values = ScalarValue::convert_array_to_scalar_vec(array.as_ref())
+                    .context(ConvertArrowArrayToScalarsSnafu)?
+                    .into_iter()
+                    .flatten()
+                    .map(ScalarValue::try_into)
+                    .collect::<Result<Vec<Value>>>()?;
+                builder.push(Some(ListValueRef::Ref {
+                    val: &ListValue::new(values, item_type),
+                }));
                 let list_vector = builder.to_vector();
                 ConstantVector::new(list_vector, length)
             }
@@ -236,8 +235,12 @@ impl Helper {
                 ConstantVector::new(Arc::new(vector), length)
             }
             ScalarValue::Decimal256(_, _, _)
-            | ScalarValue::Struct(_, _)
-            | ScalarValue::Dictionary(_, _) => {
+            | ScalarValue::Struct(_)
+            | ScalarValue::FixedSizeList(_)
+            | ScalarValue::LargeList(_)
+            | ScalarValue::Dictionary(_, _)
+            | ScalarValue::Union(_, _, _)
+            | ScalarValue::Float16(_) => {
                 return error::ConversionSnafu {
                     from: format!("Unsupported scalar value: {value}"),
                 }
@@ -256,9 +259,9 @@ impl Helper {
         Ok(match array.as_ref().data_type() {
             ArrowDataType::Null => Arc::new(NullVector::try_from_arrow_array(array)?),
             ArrowDataType::Boolean => Arc::new(BooleanVector::try_from_arrow_array(array)?),
-            ArrowDataType::LargeBinary => Arc::new(BinaryVector::try_from_arrow_array(array)?),
-            ArrowDataType::FixedSizeBinary(_) | ArrowDataType::Binary => {
-                let array = arrow::compute::cast(array.as_ref(), &ArrowDataType::LargeBinary)
+            ArrowDataType::Binary => Arc::new(BinaryVector::try_from_arrow_array(array)?),
+            ArrowDataType::LargeBinary | ArrowDataType::FixedSizeBinary(_) => {
+                let array = arrow::compute::cast(array.as_ref(), &ArrowDataType::Binary)
                     .context(crate::error::ArrowComputeSnafu)?;
                 Arc::new(BinaryVector::try_from_arrow_array(array)?)
             }
@@ -276,7 +279,7 @@ impl Helper {
             ArrowDataType::LargeUtf8 => {
                 let array = arrow::compute::cast(array.as_ref(), &ArrowDataType::Utf8)
                     .context(crate::error::ArrowComputeSnafu)?;
-                Arc::new(BinaryVector::try_from_arrow_array(array)?)
+                Arc::new(StringVector::try_from_arrow_array(array)?)
             }
             ArrowDataType::Date32 => Arc::new(DateVector::try_from_arrow_array(array)?),
             ArrowDataType::Date64 => Arc::new(DateTimeVector::try_from_arrow_array(array)?),
@@ -351,7 +354,11 @@ impl Helper {
             | ArrowDataType::Dictionary(_, _)
             | ArrowDataType::Decimal256(_, _)
             | ArrowDataType::Map(_, _)
-            | ArrowDataType::RunEndEncoded(_, _) => {
+            | ArrowDataType::RunEndEncoded(_, _)
+            | ArrowDataType::BinaryView
+            | ArrowDataType::Utf8View
+            | ArrowDataType::ListView(_)
+            | ArrowDataType::LargeListView(_) => {
                 return error::UnsupportedArrowTypeSnafu {
                     arrow_type: array.as_ref().data_type().clone(),
                 }
@@ -396,8 +403,10 @@ mod tests {
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
-    use arrow::datatypes::{Field, Int32Type};
-    use arrow_array::DictionaryArray;
+    use arrow::buffer::Buffer;
+    use arrow::datatypes::Int32Type;
+    use arrow_array::{BinaryArray, DictionaryArray, FixedSizeBinaryArray, LargeStringArray};
+    use arrow_schema::DataType;
     use common_decimal::Decimal128;
     use common_time::time::Time;
     use common_time::timestamp::TimeUnit;
@@ -486,13 +495,10 @@ mod tests {
 
     #[test]
     fn test_try_from_list_value() {
-        let value = ScalarValue::List(
-            Some(vec![
-                ScalarValue::Int32(Some(1)),
-                ScalarValue::Int32(Some(2)),
-            ]),
-            Arc::new(Field::new("item", ArrowDataType::Int32, true)),
-        );
+        let value = ScalarValue::List(ScalarValue::new_list(
+            &[ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(2))],
+            &ArrowDataType::Int32,
+        ));
         let vector = Helper::try_from_scalar_value(value, 3).unwrap();
         assert_eq!(
             ConcreteDataType::list_datatype(ConcreteDataType::int32_datatype()),
@@ -501,8 +507,8 @@ mod tests {
         assert_eq!(3, vector.len());
         for i in 0..vector.len() {
             let v = vector.get(i);
-            let items = v.as_list().unwrap().unwrap().items().as_ref().unwrap();
-            assert_eq!(vec![Value::Int32(1), Value::Int32(2)], **items);
+            let items = v.as_list().unwrap().unwrap().items();
+            assert_eq!(vec![Value::Int32(1), Value::Int32(2)], items);
         }
     }
 
@@ -573,10 +579,6 @@ mod tests {
     fn test_try_into_vector() {
         check_try_into_vector(NullArray::new(2));
         check_try_into_vector(BooleanArray::from(vec![true, false]));
-        check_try_into_vector(LargeBinaryArray::from(vec![
-            "hello".as_bytes(),
-            "world".as_bytes(),
-        ]));
         check_try_into_vector(Int8Array::from(vec![1, 2, 3]));
         check_try_into_vector(Int16Array::from(vec![1, 2, 3]));
         check_try_into_vector(Int32Array::from(vec![1, 2, 3]));
@@ -606,6 +608,52 @@ mod tests {
         let keys = Int8Array::from_iter_values([0, 0, 1, 2]);
         let array: ArrayRef = Arc::new(DictionaryArray::try_new(keys, Arc::new(values)).unwrap());
         Helper::try_into_vector(array).unwrap_err();
+    }
+
+    #[test]
+    fn test_try_binary_array_into_vector() {
+        let input_vec: Vec<&[u8]> = vec!["hello".as_bytes(), "world".as_bytes()];
+        let assertion_vector = BinaryVector::from(input_vec.clone());
+
+        let input_arrays: Vec<ArrayRef> = vec![
+            Arc::new(LargeBinaryArray::from(input_vec.clone())) as ArrayRef,
+            Arc::new(BinaryArray::from(input_vec.clone())) as ArrayRef,
+            Arc::new(FixedSizeBinaryArray::new(
+                5,
+                Buffer::from_vec("helloworld".as_bytes().to_vec()),
+                None,
+            )) as ArrayRef,
+        ];
+
+        for input_array in input_arrays {
+            let vector = Helper::try_into_vector(input_array).unwrap();
+
+            assert_eq!(2, vector.len());
+            assert_eq!(0, vector.null_count());
+
+            let output_arrow_array: ArrayRef = vector.to_arrow_array();
+            assert_eq!(&DataType::Binary, output_arrow_array.data_type());
+            assert_eq!(&assertion_vector.to_arrow_array(), &output_arrow_array);
+        }
+    }
+
+    #[test]
+    fn test_large_string_array_into_vector() {
+        let input_vec = vec!["a", "b"];
+        let assertion_array = StringArray::from(input_vec.clone());
+
+        let large_string_array: ArrayRef = Arc::new(LargeStringArray::from(input_vec));
+        let vector = Helper::try_into_vector(large_string_array).unwrap();
+        assert_eq!(2, vector.len());
+        assert_eq!(0, vector.null_count());
+
+        let output_arrow_array: StringArray = vector
+            .to_arrow_array()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(&assertion_array, &output_arrow_array);
     }
 
     #[test]

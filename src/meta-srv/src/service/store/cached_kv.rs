@@ -102,15 +102,10 @@ impl LeaderCachedKvBackend {
                 self.store.clone(),
                 RangeRequest::new().with_prefix(prefix.as_bytes()),
                 DEFAULT_PAGE_SIZE,
-                Arc::new(|kv| Ok((kv, ()))),
+                Arc::new(Ok),
             );
 
-            let kvs = stream
-                .try_collect::<Vec<_>>()
-                .await?
-                .into_iter()
-                .map(|(kv, _)| kv)
-                .collect();
+            let kvs = stream.try_collect::<Vec<_>>().await?.into_iter().collect();
 
             self.cache
                 .batch_put(BatchPutRequest {
@@ -263,7 +258,7 @@ impl KvBackend for LeaderCachedKvBackend {
             .collect::<HashSet<_>>();
 
         metrics::METRIC_META_KV_CACHE_HIT
-            .with_label_values(&[&"batch_get"])
+            .with_label_values(&["batch_get"])
             .inc_by(hit_keys.len() as u64);
 
         let missed_keys = req
@@ -273,7 +268,7 @@ impl KvBackend for LeaderCachedKvBackend {
             .cloned()
             .collect::<Vec<_>>();
         metrics::METRIC_META_KV_CACHE_MISS
-            .with_label_values(&[&"batch_get"])
+            .with_label_values(&["batch_get"])
             .inc_by(missed_keys.len() as u64);
 
         let remote_req = BatchGetRequest { keys: missed_keys };

@@ -24,12 +24,12 @@ use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::{EmptyRelation, Expr, LogicalPlan, UserDefinedLogicalNodeCore};
-use datafusion::physical_expr::{PhysicalSortExpr, PhysicalSortRequirement};
+use datafusion::physical_expr::PhysicalSortRequirement;
 use datafusion::physical_plan::expressions::Column as ColumnExpr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream,
 };
 use datatypes::arrow::compute;
 use futures::{ready, Stream, StreamExt};
@@ -67,13 +67,21 @@ impl UserDefinedLogicalNodeCore for SeriesDivide {
         write!(f, "PromSeriesDivide: tags={:?}", self.tag_columns)
     }
 
-    fn from_template(&self, _exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-        assert!(!inputs.is_empty());
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        if inputs.is_empty() {
+            return Err(datafusion::error::DataFusionError::Internal(
+                "SeriesDivide must have at least one input".to_string(),
+            ));
+        }
 
-        Self {
+        Ok(Self {
             tag_columns: self.tag_columns.clone(),
             input: inputs[0].clone(),
-        }
+        })
     }
 }
 
@@ -130,8 +138,8 @@ impl ExecutionPlan for SeriesDivideExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -156,16 +164,12 @@ impl ExecutionPlan for SeriesDivideExec {
         }
     }
 
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -212,16 +216,6 @@ impl ExecutionPlan for SeriesDivideExec {
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metric.clone_inner())
     }
-
-    fn statistics(&self) -> Statistics {
-        Statistics {
-            num_rows: None,
-            total_byte_size: None,
-            // TODO(ruihang): support this column statistics
-            column_statistics: None,
-            is_exact: false,
-        }
-    }
 }
 
 impl DisplayAs for SeriesDivideExec {
@@ -255,20 +249,23 @@ impl Stream for SeriesDivideStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(batch) = self.buffer.take() {
-                let same_length = self.find_first_diff_row(&batch) + 1;
+            if let Some(batch) = self.buffer.as_ref() {
+                let same_length = self.find_first_diff_row(batch) + 1;
                 if same_length >= batch.num_rows() {
-                    let next_batch = match ready!(self.as_mut().fetch_next_batch(cx)) {
-                        Some(Ok(next_batch)) => next_batch,
-                        None => {
-                            self.num_series += 1;
-                            return Poll::Ready(Some(Ok(batch)));
-                        }
-                        error => return Poll::Ready(error),
-                    };
-                    let new_batch = compute::concat_batches(&batch.schema(), &[batch, next_batch])?;
-                    self.buffer = Some(new_batch);
-                    continue;
+                    let next_batch = ready!(self.as_mut().fetch_next_batch(cx)).transpose()?;
+                    // SAFETY: if-let guards the buffer is not None;
+                    //   and we cannot change the buffer at this point.
+                    let batch = self.buffer.take().expect("this batch must exist");
+                    if let Some(next_batch) = next_batch {
+                        self.buffer = Some(compute::concat_batches(
+                            &batch.schema(),
+                            &[batch, next_batch],
+                        )?);
+                        continue;
+                    } else {
+                        self.num_series += 1;
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
                 } else {
                     let result_batch = batch.slice(0, same_length);
                     let remaining_batch = batch.slice(same_length, batch.num_rows() - same_length);

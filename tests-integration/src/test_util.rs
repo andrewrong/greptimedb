@@ -21,6 +21,8 @@ use std::time::Duration;
 use auth::UserProviderRef;
 use axum::Router;
 use catalog::kvbackend::KvBackendCatalogManager;
+use common_base::secrets::ExposeSecret;
+use common_config::Configurable;
 use common_meta::key::catalog_name::CatalogNameKey;
 use common_meta::key::schema_name::SchemaNameKey;
 use common_runtime::Builder as RuntimeBuilder;
@@ -32,17 +34,15 @@ use datanode::config::{
     AzblobConfig, DatanodeOptions, FileConfig, GcsConfig, ObjectStoreConfig, OssConfig, S3Config,
     StorageConfig,
 };
-use frontend::frontend::TomlSerializable;
 use frontend::instance::Instance;
 use frontend::service_config::{MysqlOptions, PostgresOptions};
 use futures::future::BoxFuture;
 use object_store::services::{Azblob, Gcs, Oss, S3};
 use object_store::test_util::TempFolder;
 use object_store::ObjectStore;
-use secrecy::ExposeSecret;
 use servers::grpc::builder::GrpcServerBuilder;
 use servers::grpc::greptime_handler::GreptimeRequestHandler;
-use servers::grpc::{GrpcServer, GrpcServerConfig};
+use servers::grpc::{GrpcOptions, GrpcServer, GrpcServerConfig};
 use servers::http::{HttpOptions, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
@@ -164,8 +164,7 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 ..Default::default()
             };
 
-            let mut builder = Gcs::default();
-            builder
+            let builder = Gcs::default()
                 .root(&gcs_config.root)
                 .bucket(&gcs_config.bucket)
                 .scope(&gcs_config.scope)
@@ -186,8 +185,7 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 ..Default::default()
             };
 
-            let mut builder = Azblob::default();
-            let _ = builder
+            let mut builder = Azblob::default()
                 .root(&azblob_config.root)
                 .endpoint(&azblob_config.endpoint)
                 .account_name(azblob_config.account_name.expose_secret())
@@ -195,8 +193,8 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 .container(&azblob_config.container);
 
             if let Ok(sas_token) = env::var("GT_AZBLOB_SAS_TOKEN") {
-                let _ = builder.sas_token(&sas_token);
-            }
+                builder = builder.sas_token(&sas_token);
+            };
 
             let config = ObjectStoreConfig::Azblob(azblob_config);
 
@@ -214,8 +212,7 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 ..Default::default()
             };
 
-            let mut builder = Oss::default();
-            let _ = builder
+            let builder = Oss::default()
                 .root(&oss_config.root)
                 .endpoint(&oss_config.endpoint)
                 .access_key_id(oss_config.access_key_id.expose_secret())
@@ -235,19 +232,18 @@ pub fn get_test_store_config(store_type: &StorageType) -> (ObjectStoreConfig, Te
                 s3_config.cache.cache_path = Some("/tmp/greptimedb_cache".to_string());
             }
 
-            let mut builder = S3::default();
-            let _ = builder
+            let mut builder = S3::default()
                 .root(&s3_config.root)
                 .access_key_id(s3_config.access_key_id.expose_secret())
                 .secret_access_key(s3_config.secret_access_key.expose_secret())
                 .bucket(&s3_config.bucket);
 
             if s3_config.endpoint.is_some() {
-                let _ = builder.endpoint(s3_config.endpoint.as_ref().unwrap());
-            }
+                builder = builder.endpoint(s3_config.endpoint.as_ref().unwrap());
+            };
             if s3_config.region.is_some() {
-                let _ = builder.region(s3_config.region.as_ref().unwrap());
-            }
+                builder = builder.region(s3_config.region.as_ref().unwrap());
+            };
 
             let config = ObjectStoreConfig::S3(s3_config);
 
@@ -346,8 +342,8 @@ pub(crate) fn create_datanode_opts(
             data_home: home_dir,
             providers,
             store: default_store,
-            ..Default::default()
         },
+        grpc: GrpcOptions::default().with_addr(PEER_PLACEHOLDER_ADDR),
         mode,
         wal: wal_config,
         ..Default::default()
@@ -393,7 +389,7 @@ pub async fn setup_test_http_app(store_type: StorageType, name: &str) -> (Router
             None,
         )
         .with_metrics_handler(MetricsHandler)
-        .with_greptime_config_options(instance.mix_options.datanode.to_toml_string())
+        .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
         .build();
     (http_server.build(http_server.make_app()), instance.guard)
 }
@@ -426,7 +422,8 @@ pub async fn setup_test_http_app_with_frontend_and_user_provider(
             ServerSqlQueryHandlerAdapter::arc(instance.instance.clone()),
             Some(instance.instance.clone()),
         )
-        .with_greptime_config_options(instance.mix_options.to_toml().unwrap());
+        .with_log_ingest_handler(instance.instance.clone(), None)
+        .with_greptime_config_options(instance.opts.to_toml().unwrap());
 
     if let Some(user_provider) = user_provider {
         http_server = http_server.with_user_provider(user_provider);
@@ -457,14 +454,15 @@ pub async fn setup_test_prom_app_with_frontend(
         ..Default::default()
     };
     let frontend_ref = instance.instance.clone();
+    let is_strict_mode = true;
     let http_server = HttpServerBuilder::new(http_opts)
         .with_sql_handler(
             ServerSqlQueryHandlerAdapter::arc(frontend_ref.clone()),
             Some(frontend_ref.clone()),
         )
-        .with_prom_handler(frontend_ref.clone(), true)
+        .with_prom_handler(frontend_ref.clone(), true, is_strict_mode)
         .with_prometheus_handler(frontend_ref)
-        .with_greptime_config_options(instance.mix_options.datanode.to_toml_string())
+        .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
         .build();
     let app = http_server.build(http_server.make_app());
     (app, instance.guard)
@@ -493,31 +491,31 @@ pub async fn setup_grpc_server_with(
 ) -> (String, TestGuard, Arc<GrpcServer>) {
     let instance = setup_standalone_instance(name, store_type).await;
 
-    let runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(2)
-            .thread_name("grpc-handlers")
-            .build()
-            .unwrap(),
-    );
+    let runtime = RuntimeBuilder::default()
+        .worker_threads(2)
+        .thread_name("grpc-handlers")
+        .build()
+        .unwrap();
 
     let fe_instance_ref = instance.instance.clone();
 
     let greptime_request_handler = GreptimeRequestHandler::new(
         ServerGrpcQueryHandlerAdapter::arc(fe_instance_ref.clone()),
         user_provider.clone(),
-        runtime.clone(),
+        Some(runtime.clone()),
     );
 
     let flight_handler = Arc::new(greptime_request_handler.clone());
 
-    let fe_grpc_server = Arc::new(
-        GrpcServerBuilder::new(grpc_config.unwrap_or_default(), runtime)
-            .database_handler(greptime_request_handler)
-            .flight_handler(flight_handler)
-            .prometheus_handler(fe_instance_ref.clone(), user_provider)
-            .build(),
-    );
+    let grpc_config = grpc_config.unwrap_or_default();
+    let grpc_builder = GrpcServerBuilder::new(grpc_config.clone(), runtime)
+        .database_handler(greptime_request_handler)
+        .flight_handler(flight_handler)
+        .prometheus_handler(fe_instance_ref.clone(), user_provider)
+        .with_tls_config(grpc_config.tls)
+        .unwrap();
+
+    let fe_grpc_server = Arc::new(grpc_builder.build());
 
     let fe_grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let fe_grpc_addr = fe_grpc_server
@@ -546,13 +544,11 @@ pub async fn setup_mysql_server_with_user_provider(
 ) -> (String, TestGuard, Arc<Box<dyn Server>>) {
     let instance = setup_standalone_instance(name, store_type).await;
 
-    let runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(2)
-            .thread_name("mysql-runtime")
-            .build()
-            .unwrap(),
-    );
+    let runtime = RuntimeBuilder::default()
+        .worker_threads(2)
+        .thread_name("mysql-runtime")
+        .build()
+        .unwrap();
 
     let fe_mysql_addr = format!("127.0.0.1:{}", ports::get_port());
 
@@ -603,13 +599,11 @@ pub async fn setup_pg_server_with_user_provider(
 ) -> (String, TestGuard, Arc<Box<dyn Server>>) {
     let instance = setup_standalone_instance(name, store_type).await;
 
-    let runtime = Arc::new(
-        RuntimeBuilder::default()
-            .worker_threads(2)
-            .thread_name("pg-runtime")
-            .build()
-            .unwrap(),
-    );
+    let runtime = RuntimeBuilder::default()
+        .worker_threads(2)
+        .thread_name("pg-runtime")
+        .build()
+        .unwrap();
 
     let fe_pg_addr = format!("127.0.0.1:{}", ports::get_port());
 

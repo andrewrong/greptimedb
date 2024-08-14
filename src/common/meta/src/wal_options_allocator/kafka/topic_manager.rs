@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use common_telemetry::{error, info};
-use common_wal::config::kafka::MetaSrvKafkaConfig;
+use common_wal::config::kafka::MetasrvKafkaConfig;
 use common_wal::TopicSelectorType;
 use rskafka::client::controller::ControllerClient;
 use rskafka::client::error::Error as RsKafkaError;
@@ -46,7 +46,7 @@ const DEFAULT_PARTITION: i32 = 0;
 
 /// Manages topic initialization and selection.
 pub struct TopicManager {
-    config: MetaSrvKafkaConfig,
+    config: MetasrvKafkaConfig,
     pub(crate) topic_pool: Vec<String>,
     pub(crate) topic_selector: TopicSelectorRef,
     kv_backend: KvBackendRef,
@@ -54,13 +54,13 @@ pub struct TopicManager {
 
 impl TopicManager {
     /// Creates a new topic manager.
-    pub fn new(config: MetaSrvKafkaConfig, kv_backend: KvBackendRef) -> Self {
+    pub fn new(config: MetasrvKafkaConfig, kv_backend: KvBackendRef) -> Self {
         // Topics should be created.
-        let topics = (0..config.num_topics)
-            .map(|topic_id| format!("{}_{topic_id}", config.topic_name_prefix))
+        let topics = (0..config.kafka_topic.num_topics)
+            .map(|topic_id| format!("{}_{topic_id}", config.kafka_topic.topic_name_prefix))
             .collect::<Vec<_>>();
 
-        let selector = match config.selector_type {
+        let selector = match config.kafka_topic.selector_type {
             TopicSelectorType::RoundRobin => RoundRobinTopicSelector::with_shuffle(),
         };
 
@@ -76,7 +76,7 @@ impl TopicManager {
     /// The initializer first tries to restore persisted topics from the kv backend.
     /// If not enough topics retrieved, the initializer will try to contact the Kafka cluster and request creating more topics.
     pub async fn start(&self) -> Result<()> {
-        let num_topics = self.config.num_topics;
+        let num_topics = self.config.kafka_topic.num_topics;
         ensure!(num_topics > 0, InvalidNumTopicsSnafu { num_topics });
 
         // Topics should be created.
@@ -173,7 +173,7 @@ impl TopicManager {
                     timestamp: chrono::Utc::now(),
                     headers: Default::default(),
                 }],
-                Compression::NoCompression,
+                Compression::Lz4,
             )
             .await
             .context(ProduceRecordSnafu { topic })?;
@@ -185,9 +185,9 @@ impl TopicManager {
         match client
             .create_topic(
                 topic.clone(),
-                self.config.num_partitions,
-                self.config.replication_factor,
-                self.config.create_topic_timeout.as_millis() as i32,
+                self.config.kafka_topic.num_partitions,
+                self.config.kafka_topic.replication_factor,
+                self.config.kafka_topic.create_topic_timeout.as_millis() as i32,
             )
             .await
         {
@@ -242,6 +242,7 @@ impl TopicManager {
 
 #[cfg(test)]
 mod tests {
+    use common_wal::config::kafka::common::KafkaTopicConfig;
     use common_wal::test_util::run_test_with_kafka_wal;
 
     use super::*;
@@ -283,15 +284,19 @@ mod tests {
                     .collect::<Vec<_>>();
 
                 // Creates a topic manager.
-                let config = MetaSrvKafkaConfig {
+                let kafka_topic = KafkaTopicConfig {
                     replication_factor: broker_endpoints.len() as i16,
+                    ..Default::default()
+                };
+                let config = MetasrvKafkaConfig {
                     broker_endpoints,
+                    kafka_topic,
                     ..Default::default()
                 };
                 let kv_backend = Arc::new(MemoryKvBackend::new()) as KvBackendRef;
                 let mut manager = TopicManager::new(config.clone(), kv_backend);
                 // Replaces the default topic pool with the constructed topics.
-                manager.topic_pool = topics.clone();
+                manager.topic_pool.clone_from(&topics);
                 // Replaces the default selector with a round-robin selector without shuffled.
                 manager.topic_selector = Arc::new(RoundRobinTopicSelector::default());
                 manager.start().await.unwrap();

@@ -13,118 +13,28 @@
 // limitations under the License.
 
 use std::assert_matches::assert_matches;
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use api::v1::meta::Partition;
-use api::v1::region::{QueryRequest, RegionRequest};
-use api::v1::{ColumnDataType, SemanticType};
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_procedure::{Context as ProcedureContext, Procedure, ProcedureId, Status};
 use common_procedure_test::MockContextProvider;
-use common_recordbatch::SendableRecordBatchStream;
-use common_telemetry::debug;
 use store_api::storage::RegionId;
-use table::metadata::RawTableInfo;
 
 use crate::ddl::create_logical_tables::CreateLogicalTablesProcedure;
-use crate::ddl::test_util::create_table::build_raw_table_info_from_expr;
-use crate::ddl::test_util::{TestColumnDefBuilder, TestCreateTableExprBuilder};
-use crate::ddl::{DdlContext, TableMetadata, TableMetadataAllocatorContext};
-use crate::error::{Error, Result};
+use crate::ddl::test_util::datanode_handler::NaiveDatanodeHandler;
+use crate::ddl::test_util::{
+    create_physical_table_metadata, test_create_logical_table_task, test_create_physical_table_task,
+};
+use crate::ddl::{TableMetadata, TableMetadataAllocatorContext};
+use crate::error::Error;
 use crate::key::table_route::TableRouteValue;
-use crate::peer::Peer;
-use crate::rpc::ddl::CreateTableTask;
-use crate::test_util::{new_ddl_context, AffectedRows, MockDatanodeHandler, MockDatanodeManager};
-
-// Note: this code may be duplicated with others.
-// However, it's by design, ensures the tests are easy to be modified or added.
-fn test_create_logical_table_task(name: &str) -> CreateTableTask {
-    let create_table = TestCreateTableExprBuilder::default()
-        .column_defs([
-            TestColumnDefBuilder::default()
-                .name("ts")
-                .data_type(ColumnDataType::TimestampMillisecond)
-                .semantic_type(SemanticType::Timestamp)
-                .build()
-                .unwrap()
-                .into(),
-            TestColumnDefBuilder::default()
-                .name("host")
-                .data_type(ColumnDataType::String)
-                .semantic_type(SemanticType::Tag)
-                .build()
-                .unwrap()
-                .into(),
-            TestColumnDefBuilder::default()
-                .name("cpu")
-                .data_type(ColumnDataType::Float64)
-                .semantic_type(SemanticType::Field)
-                .build()
-                .unwrap()
-                .into(),
-        ])
-        .time_index("ts")
-        .primary_keys(["host".into()])
-        .table_name(name)
-        .build()
-        .unwrap()
-        .into();
-    let table_info = build_raw_table_info_from_expr(&create_table);
-    CreateTableTask {
-        create_table,
-        // Single region
-        partitions: vec![Partition {
-            column_list: vec![],
-            value_list: vec![],
-        }],
-        table_info,
-    }
-}
-
-// Note: this code may be duplicated with others.
-// However, it's by design, ensures the tests are easy to be modified or added.
-fn test_create_physical_table_task(name: &str) -> CreateTableTask {
-    let create_table = TestCreateTableExprBuilder::default()
-        .column_defs([
-            TestColumnDefBuilder::default()
-                .name("ts")
-                .data_type(ColumnDataType::TimestampMillisecond)
-                .semantic_type(SemanticType::Timestamp)
-                .build()
-                .unwrap()
-                .into(),
-            TestColumnDefBuilder::default()
-                .name("value")
-                .data_type(ColumnDataType::Float64)
-                .semantic_type(SemanticType::Field)
-                .build()
-                .unwrap()
-                .into(),
-        ])
-        .time_index("ts")
-        .primary_keys(["value".into()])
-        .table_name(name)
-        .build()
-        .unwrap()
-        .into();
-    let table_info = build_raw_table_info_from_expr(&create_table);
-    CreateTableTask {
-        create_table,
-        // Single region
-        partitions: vec![Partition {
-            column_list: vec![],
-            value_list: vec![],
-        }],
-        table_info,
-    }
-}
+use crate::test_util::{new_ddl_context, MockDatanodeManager};
 
 #[tokio::test]
 async fn test_on_prepare_physical_table_not_found() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(()));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     let tasks = vec![test_create_logical_table_task("foo")];
     let physical_table_id = 1024u32;
@@ -134,22 +44,10 @@ async fn test_on_prepare_physical_table_not_found() {
     assert_matches!(err, Error::TableRouteNotFound { .. });
 }
 
-async fn create_physical_table_metadata(
-    ddl_context: &DdlContext,
-    table_info: RawTableInfo,
-    table_route: TableRouteValue,
-) {
-    ddl_context
-        .table_metadata_manager
-        .create_table_metadata(table_info, table_route, HashMap::default())
-        .await
-        .unwrap();
-}
-
 #[tokio::test]
 async fn test_on_prepare() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(()));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -169,7 +67,7 @@ async fn test_on_prepare() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // The create logical table procedure.
@@ -183,8 +81,8 @@ async fn test_on_prepare() {
 
 #[tokio::test]
 async fn test_on_prepare_logical_table_exists_err() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(()));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -204,7 +102,7 @@ async fn test_on_prepare_logical_table_exists_err() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // Creates the logical table metadata.
@@ -229,8 +127,8 @@ async fn test_on_prepare_logical_table_exists_err() {
 
 #[tokio::test]
 async fn test_on_prepare_with_create_if_table_exists() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(()));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -250,7 +148,7 @@ async fn test_on_prepare_with_create_if_table_exists() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // Creates the logical table metadata.
@@ -277,8 +175,8 @@ async fn test_on_prepare_with_create_if_table_exists() {
 
 #[tokio::test]
 async fn test_on_prepare_part_logical_tables_exist() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(()));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -298,7 +196,7 @@ async fn test_on_prepare_part_logical_tables_exist() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // Creates the logical table metadata.
@@ -327,29 +225,10 @@ async fn test_on_prepare_part_logical_tables_exist() {
     assert_matches!(status, Status::Executing { persist: true });
 }
 
-#[derive(Clone)]
-pub struct NaiveDatanodeHandler;
-
-#[async_trait::async_trait]
-impl MockDatanodeHandler for NaiveDatanodeHandler {
-    async fn handle(&self, peer: &Peer, request: RegionRequest) -> Result<AffectedRows> {
-        debug!("Returning Ok(0) for request: {request:?}, peer: {peer:?}");
-        Ok(0)
-    }
-
-    async fn handle_query(
-        &self,
-        _peer: &Peer,
-        _request: QueryRequest,
-    ) -> Result<SendableRecordBatchStream> {
-        unreachable!()
-    }
-}
-
 #[tokio::test]
 async fn test_on_create_metadata() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -369,7 +248,7 @@ async fn test_on_create_metadata() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // The create logical table procedure.
@@ -398,8 +277,8 @@ async fn test_on_create_metadata() {
 
 #[tokio::test]
 async fn test_on_create_metadata_part_logical_tables_exist() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -419,7 +298,7 @@ async fn test_on_create_metadata_part_logical_tables_exist() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // Creates the logical table metadata.
@@ -459,8 +338,8 @@ async fn test_on_create_metadata_part_logical_tables_exist() {
 
 #[tokio::test]
 async fn test_on_create_metadata_err() {
-    let datanode_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
-    let ddl_context = new_ddl_context(datanode_manager);
+    let node_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
+    let ddl_context = new_ddl_context(node_manager);
     let cluster_id = 1;
     // Prepares physical table metadata.
     let mut create_physical_table_task = test_create_physical_table_task("phy_table");
@@ -480,7 +359,7 @@ async fn test_on_create_metadata_err() {
     create_physical_table_metadata(
         &ddl_context,
         create_physical_table_task.table_info.clone(),
-        table_route,
+        TableRouteValue::Physical(table_route),
     )
     .await;
     // The create logical table procedure.

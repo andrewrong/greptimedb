@@ -34,6 +34,7 @@ mod test {
     use frontend::instance::Instance;
     use query::parser::QueryLanguageParser;
     use query::plan::LogicalPlan;
+    use query::query_engine::DefaultSerializer;
     use servers::query_handler::grpc::GrpcQueryHandler;
     use session::context::QueryContext;
     use store_api::storage::RegionId;
@@ -73,7 +74,8 @@ mod test {
     async fn test_handle_ddl_request(instance: &Instance) {
         let request = Request::Ddl(DdlRequest {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
-                database_name: "database_created_through_grpc".to_string(),
+                catalog_name: "greptime".to_string(),
+                schema_name: "database_created_through_grpc".to_string(),
                 create_if_not_exists: true,
                 options: Default::default(),
             })),
@@ -543,7 +545,9 @@ CREATE TABLE {table_name} (
             .plan(stmt, QueryContext::arc())
             .await
             .unwrap();
-        let plan = DFLogicalSubstraitConvertor.encode(&plan).unwrap();
+        let plan = DFLogicalSubstraitConvertor
+            .encode(&plan, DefaultSerializer)
+            .unwrap();
 
         for (region, dn) in region_to_dn_map.iter() {
             let region_server = instance.datanodes().get(dn).unwrap().region_server();
@@ -551,7 +555,7 @@ CREATE TABLE {table_name} (
             let region_id = RegionId::new(table_id, *region);
 
             let stream = region_server
-                .handle_read(RegionQueryRequest {
+                .handle_remote_read(RegionQueryRequest {
                     region_id: region_id.as_u64(),
                     plan: plan.to_vec(),
                     ..Default::default()
@@ -648,7 +652,7 @@ CREATE TABLE {table_name} (
 
         let request = Request::Query(QueryRequest {
             query: Some(Query::Sql(
-                "SELECT ts, a, b FROM auto_created_table".to_string(),
+                "SELECT ts, a, b FROM auto_created_table order by ts".to_string(),
             )),
         });
         let output = query(instance, request.clone()).await;
@@ -789,6 +793,7 @@ CREATE TABLE {table_name} (
                 start: "1672557973".to_owned(),
                 end: "1672557978".to_owned(),
                 step: "1s".to_owned(),
+                lookback: "5m".to_string(),
             })),
         });
         let output = query(instance, request).await;

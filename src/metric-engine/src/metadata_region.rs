@@ -167,7 +167,7 @@ impl MetadataRegion {
 
     // TODO(ruihang): avoid using `get_all`
     /// Get all the columns of a given logical region.
-    /// Return a list of (column_name, semantic_type).
+    /// Return a list of (column_name, column_metadata).
     pub async fn logical_columns(
         &self,
         physical_region_id: RegionId,
@@ -300,7 +300,7 @@ impl MetadataRegion {
         let scan_req = Self::build_read_request(key);
         let record_batch_stream = self
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .context(MitoReadOperationSnafu)?;
         let scan_result = collect(record_batch_stream)
@@ -317,7 +317,7 @@ impl MetadataRegion {
         let scan_req = Self::build_read_request(key);
         let record_batch_stream = self
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .context(MitoReadOperationSnafu)?;
         let scan_result = collect(record_batch_stream)
@@ -348,10 +348,11 @@ impl MetadataRegion {
             filters: vec![],
             output_ordering: None,
             limit: None,
+            series_row_selector: None,
         };
         let record_batch_stream = self
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .context(MitoReadOperationSnafu)?;
         let scan_result = collect(record_batch_stream)
@@ -402,9 +403,10 @@ impl MetadataRegion {
 
         ScanRequest {
             projection: Some(vec![METADATA_SCHEMA_VALUE_COLUMN_INDEX]),
-            filters: vec![filter_expr.into()],
+            filters: vec![filter_expr],
             output_ordering: None,
             limit: None,
+            series_row_selector: None,
         }
     }
 
@@ -562,9 +564,10 @@ mod test {
         let expected_filter_expr = col(METADATA_SCHEMA_KEY_COLUMN_NAME).eq(lit(key));
         let expected_scan_request = ScanRequest {
             projection: Some(vec![METADATA_SCHEMA_VALUE_COLUMN_INDEX]),
-            filters: vec![expected_filter_expr.into()],
+            filters: vec![expected_filter_expr],
             output_ordering: None,
             limit: None,
+            series_row_selector: None,
         };
         let actual_scan_request = MetadataRegion::build_read_request(key);
         assert_eq!(actual_scan_request, expected_scan_request);
@@ -590,7 +593,7 @@ mod test {
         let scan_req = MetadataRegion::build_read_request("test_key");
         let record_batch_stream = metadata_region
             .mito
-            .handle_query(region_id, scan_req)
+            .scan_to_stream(region_id, scan_req)
             .await
             .unwrap();
         let scan_result = collect(record_batch_stream).await.unwrap();

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use secrecy::ExposeSecret;
+use common_base::secrets::ExposeSecret;
 
 use crate::error::{
     AccessDeniedSnafu, Result, UnsupportedPasswordTypeSnafu, UserNotFoundSnafu,
@@ -45,9 +45,9 @@ impl Default for MockUserProvider {
 
 impl MockUserProvider {
     pub fn set_authorization_info(&mut self, info: DatabaseAuthInfo) {
-        self.catalog = info.catalog.to_owned();
-        self.schema = info.schema.to_owned();
-        self.username = info.username.to_owned();
+        info.catalog.clone_into(&mut self.catalog);
+        info.schema.clone_into(&mut self.schema);
+        info.username.clone_into(&mut self.username);
     }
 }
 

@@ -14,7 +14,7 @@
 
 use core::default::Default;
 use std::cmp::Ordering;
-use std::fmt::{Display, Formatter, Write};
+use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
@@ -41,7 +41,7 @@ use crate::{error, Interval};
 /// # Note:
 /// For values out of range, you can still store these timestamps, but while performing arithmetic
 /// or formatting operations, it will return an error or just overflow.
-#[derive(Debug, Clone, Default, Copy, Serialize, Deserialize)]
+#[derive(Clone, Default, Copy, Serialize, Deserialize)]
 pub struct Timestamp {
     value: i64,
     unit: TimeUnit,
@@ -357,7 +357,7 @@ impl Timestamp {
 
     pub fn to_chrono_datetime(&self) -> Option<NaiveDateTime> {
         let (sec, nsec) = self.split();
-        NaiveDateTime::from_timestamp_opt(sec, nsec)
+        chrono::DateTime::from_timestamp(sec, nsec).map(|x| x.naive_utc())
     }
 
     pub fn to_chrono_datetime_with_timezone(&self, tz: Option<&Timezone>) -> Option<NaiveDateTime> {
@@ -380,8 +380,8 @@ impl Timestamp {
     }
 
     pub fn from_chrono_datetime(ndt: NaiveDateTime) -> Option<Self> {
-        let sec = ndt.timestamp();
-        let nsec = ndt.timestamp_subsec_nanos();
+        let sec = ndt.and_utc().timestamp();
+        let nsec = ndt.and_utc().timestamp_subsec_nanos();
         Timestamp::from_splits(sec, nsec)
     }
 
@@ -441,6 +441,11 @@ impl Timestamp {
 
         ParseTimestampSnafu { raw: s }.fail()
     }
+
+    pub fn negative(mut self) -> Self {
+        self.value = -self.value;
+        self
+    }
 }
 
 impl Timestamp {
@@ -495,6 +500,12 @@ impl From<Timestamp> for i64 {
 impl From<Timestamp> for serde_json::Value {
     fn from(d: Timestamp) -> Self {
         serde_json::Value::String(d.to_iso8601_string())
+    }
+}
+
+impl fmt::Debug for Timestamp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}::{}", self.value, self.unit)
     }
 }
 
@@ -1063,9 +1074,9 @@ mod tests {
         let _ = Timestamp::new(i64::MAX, TimeUnit::Nanosecond).split();
         let _ = Timestamp::new(i64::MIN, TimeUnit::Nanosecond).split();
         let (sec, nsec) = Timestamp::new(i64::MIN, TimeUnit::Nanosecond).split();
-        let time = NaiveDateTime::from_timestamp_opt(sec, nsec).unwrap();
-        assert_eq!(sec, time.timestamp());
-        assert_eq!(nsec, time.timestamp_subsec_nanos());
+        let time = DateTime::from_timestamp(sec, nsec).unwrap().naive_utc();
+        assert_eq!(sec, time.and_utc().timestamp());
+        assert_eq!(nsec, time.and_utc().timestamp_subsec_nanos());
     }
 
     #[test]
@@ -1159,12 +1170,12 @@ mod tests {
     #[test]
     fn test_subtract_timestamp() {
         assert_eq!(
-            Some(chrono::Duration::milliseconds(42)),
+            chrono::Duration::try_milliseconds(42),
             Timestamp::new_millisecond(100).sub(&Timestamp::new_millisecond(58))
         );
 
         assert_eq!(
-            Some(chrono::Duration::milliseconds(-42)),
+            chrono::Duration::try_milliseconds(-42),
             Timestamp::new_millisecond(58).sub(&Timestamp::new_millisecond(100))
         );
     }
@@ -1286,8 +1297,8 @@ mod tests {
 
     #[test]
     fn test_from_naive_date_time() {
-        let naive_date_time_min = NaiveDateTime::MIN;
-        let naive_date_time_max = NaiveDateTime::MAX;
+        let naive_date_time_min = NaiveDateTime::MIN.and_utc();
+        let naive_date_time_max = NaiveDateTime::MAX.and_utc();
 
         let min_sec = Timestamp::new_second(naive_date_time_min.timestamp());
         let max_sec = Timestamp::new_second(naive_date_time_max.timestamp());
@@ -1380,6 +1391,26 @@ mod tests {
         assert_eq!(
             "+262142-12-31 23:59:59",
             Timestamp::MAX_SECOND.to_timezone_aware_string(Some(&Timezone::Named(Tz::UTC)))
+        );
+    }
+
+    #[test]
+    fn test_debug_timestamp() {
+        assert_eq!(
+            "1000::Second",
+            format!("{:?}", Timestamp::new(1000, TimeUnit::Second))
+        );
+        assert_eq!(
+            "1001::Millisecond",
+            format!("{:?}", Timestamp::new(1001, TimeUnit::Millisecond))
+        );
+        assert_eq!(
+            "1002::Microsecond",
+            format!("{:?}", Timestamp::new(1002, TimeUnit::Microsecond))
+        );
+        assert_eq!(
+            "1003::Nanosecond",
+            format!("{:?}", Timestamp::new(1003, TimeUnit::Nanosecond))
         );
     }
 }

@@ -19,24 +19,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use catalog::CatalogManagerRef;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_meta::table_name::TableName;
 use datafusion::common::Result;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::execution::context::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeVisitor, VisitRecursion};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::TableReference;
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode};
-use datafusion_optimizer::analyzer::Analyzer;
+use session::context::QueryContext;
 use snafu::{OptionExt, ResultExt};
 use store_api::storage::RegionId;
-use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 pub use table::metadata::TableType;
 use table::table::adapter::DfTableProviderAdapter;
+use table::table_name::TableName;
 
 use crate::dist_plan::merge_scan::{MergeScanExec, MergeScanLogicalPlan};
-use crate::error;
 use crate::error::{CatalogSnafu, TableNotFoundSnafu};
 use crate::region_query::RegionQueryHandlerRef;
 
@@ -73,8 +71,9 @@ impl ExtensionPlanner for DistExtensionPlanner {
 
         let input_plan = merge_scan.input();
         let fallback = |logical_plan| async move {
+            let optimized_plan = self.optimize_input_logical_plan(session_state, logical_plan)?;
             planner
-                .create_physical_plan(logical_plan, session_state)
+                .create_physical_plan(&optimized_plan, session_state)
                 .await
                 .map(Some)
         };
@@ -84,31 +83,31 @@ impl ExtensionPlanner for DistExtensionPlanner {
             return fallback(input_plan).await;
         }
 
-        let optimized_plan = self.optimize_input_logical_plan(session_state, input_plan)?;
+        let optimized_plan = input_plan;
         let Some(table_name) = Self::extract_full_table_name(input_plan)? else {
             // no relation found in input plan, going to execute them locally
-            return fallback(&optimized_plan).await;
+            return fallback(optimized_plan).await;
         };
 
         let Ok(regions) = self.get_regions(&table_name).await else {
             // no peers found, going to execute them locally
-            return fallback(&optimized_plan).await;
+            return fallback(optimized_plan).await;
         };
 
         // TODO(ruihang): generate different execution plans for different variant merge operation
         let schema = optimized_plan.schema().as_ref().into();
-        // Pass down the original plan, allow execution nodes to do their optimization
-        let amended_plan = Self::plan_with_full_table_name(input_plan.clone(), &table_name)?;
-        let substrait_plan = DFLogicalSubstraitConvertor
-            .encode(&amended_plan)
-            .context(error::EncodeSubstraitLogicalPlanSnafu)?
-            .into();
+        let query_ctx = session_state
+            .config()
+            .get_extension()
+            .unwrap_or_else(QueryContext::arc);
         let merge_scan_plan = MergeScanExec::new(
             table_name,
             regions,
-            substrait_plan,
+            input_plan.clone(),
             &schema,
             self.region_query_handler.clone(),
+            query_ctx,
+            session_state.config().target_partitions(),
         )?;
         Ok(Some(Arc::new(merge_scan_plan) as _))
     }
@@ -120,11 +119,6 @@ impl DistExtensionPlanner {
         let mut extractor = TableNameExtractor::default();
         let _ = plan.visit(&mut extractor)?;
         Ok(extractor.table_name)
-    }
-
-    /// Apply the fully resolved table name to the TableScan plan
-    fn plan_with_full_table_name(plan: LogicalPlan, name: &TableName) -> Result<LogicalPlan> {
-        plan.transform(&|plan| TableNameRewriter::rewrite_table_name(plan, name))
     }
 
     async fn get_regions(&self, table_name: &TableName) -> Result<Vec<RegionId>> {
@@ -143,16 +137,14 @@ impl DistExtensionPlanner {
         Ok(table.table_info().region_ids())
     }
 
-    // TODO(ruihang): find a more elegant way to optimize input logical plan
+    /// Input logical plan is analyzed. Thus only call logical optimizer to optimize it.
     fn optimize_input_logical_plan(
         &self,
         session_state: &SessionState,
         plan: &LogicalPlan,
     ) -> Result<LogicalPlan> {
         let state = session_state.clone();
-        let analyzer = Analyzer::default();
-        let state = state.with_analyzer_rules(analyzer.rules);
-        state.optimize(plan)
+        state.optimizer().optimize(plan.clone(), &state, |_, _| {})
     }
 }
 
@@ -162,10 +154,10 @@ struct TableNameExtractor {
     pub table_name: Option<TableName>,
 }
 
-impl TreeNodeVisitor for TableNameExtractor {
-    type N = LogicalPlan;
+impl TreeNodeVisitor<'_> for TableNameExtractor {
+    type Node = LogicalPlan;
 
-    fn pre_visit(&mut self, node: &Self::N) -> Result<VisitRecursion> {
+    fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
         match node {
             LogicalPlan::TableScan(scan) => {
                 if let Some(source) = scan.source.as_any().downcast_ref::<DefaultTableSource>() {
@@ -182,7 +174,7 @@ impl TreeNodeVisitor for TableNameExtractor {
                                 info.name.clone(),
                             ));
                         }
-                        return Ok(VisitRecursion::Stop);
+                        return Ok(TreeNodeRecursion::Stop);
                     }
                 }
                 match &scan.table_name {
@@ -192,53 +184,32 @@ impl TreeNodeVisitor for TableNameExtractor {
                         table,
                     } => {
                         self.table_name = Some(TableName::new(
-                            catalog.clone(),
-                            schema.clone(),
-                            table.clone(),
+                            catalog.to_string(),
+                            schema.to_string(),
+                            table.to_string(),
                         ));
-                        Ok(VisitRecursion::Stop)
+                        Ok(TreeNodeRecursion::Stop)
                     }
                     // TODO(ruihang): Maybe the following two cases should not be valid
                     TableReference::Partial { schema, table } => {
                         self.table_name = Some(TableName::new(
                             DEFAULT_CATALOG_NAME.to_string(),
-                            schema.clone(),
-                            table.clone(),
+                            schema.to_string(),
+                            table.to_string(),
                         ));
-                        Ok(VisitRecursion::Stop)
+                        Ok(TreeNodeRecursion::Stop)
                     }
                     TableReference::Bare { table } => {
                         self.table_name = Some(TableName::new(
                             DEFAULT_CATALOG_NAME.to_string(),
                             DEFAULT_SCHEMA_NAME.to_string(),
-                            table.clone(),
+                            table.to_string(),
                         ));
-                        Ok(VisitRecursion::Stop)
+                        Ok(TreeNodeRecursion::Stop)
                     }
                 }
             }
-            _ => Ok(VisitRecursion::Continue),
+            _ => Ok(TreeNodeRecursion::Continue),
         }
-    }
-}
-
-struct TableNameRewriter;
-
-impl TableNameRewriter {
-    fn rewrite_table_name(
-        plan: LogicalPlan,
-        name: &TableName,
-    ) -> datafusion_common::Result<Transformed<LogicalPlan>> {
-        Ok(match plan {
-            LogicalPlan::TableScan(mut table_scan) => {
-                table_scan.table_name = TableReference::full(
-                    name.catalog_name.clone(),
-                    name.schema_name.clone(),
-                    name.table_name.clone(),
-                );
-                Transformed::Yes(LogicalPlan::TableScan(table_scan))
-            }
-            _ => Transformed::No(plan),
-        })
     }
 }

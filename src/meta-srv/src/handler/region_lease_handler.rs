@@ -116,7 +116,7 @@ mod test {
 
     use super::*;
     use crate::handler::node_stat::{RegionStat, Stat};
-    use crate::metasrv::builder::MetaSrvBuilder;
+    use crate::metasrv::builder::MetasrvBuilder;
 
     fn new_test_keeper() -> RegionLeaseKeeper {
         let store = Arc::new(MemoryKvBackend::new());
@@ -134,7 +134,6 @@ mod test {
             rcus: 0,
             wcus: 0,
             approximate_bytes: 0,
-            approximate_rows: 0,
             engine: String::new(),
         }
     }
@@ -170,7 +169,7 @@ mod test {
             .await
             .unwrap();
 
-        let builder = MetaSrvBuilder::new();
+        let builder = MetasrvBuilder::new();
         let metasrv = builder.build().await.unwrap();
         let ctx = &mut metasrv.new_ctx();
 
@@ -317,7 +316,7 @@ mod test {
             .await
             .unwrap();
 
-        let builder = MetaSrvBuilder::new();
+        let builder = MetasrvBuilder::new();
         let metasrv = builder.build().await.unwrap();
         let ctx = &mut metasrv.new_ctx();
 

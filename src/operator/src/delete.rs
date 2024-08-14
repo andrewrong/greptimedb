@@ -19,7 +19,7 @@ use std::{iter, mem};
 use api::v1::region::{DeleteRequests as RegionDeleteRequests, RegionRequestHeader};
 use api::v1::{DeleteRequests, RowDeleteRequests};
 use catalog::CatalogManagerRef;
-use common_meta::datanode_manager::{AffectedRows, DatanodeManagerRef};
+use common_meta::node_manager::{AffectedRows, NodeManagerRef};
 use common_meta::peer::Peer;
 use common_query::Output;
 use common_telemetry::tracing_context::TracingContext;
@@ -40,7 +40,7 @@ use crate::req_convert::delete::{ColumnToRow, RowToRegion, TableToRegion};
 pub struct Deleter {
     catalog_manager: CatalogManagerRef,
     partition_manager: PartitionRuleManagerRef,
-    datanode_manager: DatanodeManagerRef,
+    node_manager: NodeManagerRef,
 }
 
 pub type DeleterRef = Arc<Deleter>;
@@ -49,12 +49,12 @@ impl Deleter {
     pub fn new(
         catalog_manager: CatalogManagerRef,
         partition_manager: PartitionRuleManagerRef,
-        datanode_manager: DatanodeManagerRef,
+        node_manager: NodeManagerRef,
     ) -> Self {
         Self {
             catalog_manager,
             partition_manager,
-            datanode_manager,
+            node_manager,
         }
     }
 
@@ -124,6 +124,7 @@ impl Deleter {
         let request_factory = RegionRequestFactory::new(RegionRequestHeader {
             tracing_context: TracingContext::from_current_span().to_w3c(),
             dbname: ctx.get_db_string(),
+            ..Default::default()
         });
 
         let tasks = self
@@ -132,9 +133,9 @@ impl Deleter {
             .into_iter()
             .map(|(peer, deletes)| {
                 let request = request_factory.build_delete(deletes);
-                let datanode_manager = self.datanode_manager.clone();
-                common_runtime::spawn_write(async move {
-                    datanode_manager
+                let node_manager = self.node_manager.clone();
+                common_runtime::spawn_global(async move {
+                    node_manager
                         .datanode(&peer)
                         .await
                         .handle(request)
@@ -144,7 +145,10 @@ impl Deleter {
             });
         let results = future::try_join_all(tasks).await.context(JoinTaskSnafu)?;
 
-        let affected_rows = results.into_iter().sum::<Result<AffectedRows>>()?;
+        let affected_rows = results
+            .into_iter()
+            .map(|resp| resp.map(|r| r.affected_rows))
+            .sum::<Result<AffectedRows>>()?;
         crate::metrics::DIST_DELETE_ROW_COUNT.inc_by(affected_rows as u64);
         Ok(affected_rows)
     }
@@ -175,7 +179,7 @@ impl Deleter {
         for req in &mut requests.deletes {
             let catalog = ctx.current_catalog();
             let schema = ctx.current_schema();
-            let table = self.get_table(catalog, schema, &req.table_name).await?;
+            let table = self.get_table(catalog, &schema, &req.table_name).await?;
             let key_column_names = self.key_column_names(&table)?;
 
             let rows = req.rows.as_mut().unwrap();

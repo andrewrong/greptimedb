@@ -19,19 +19,22 @@ use std::time::Duration;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use catalog::table_source::DfTableSourceProvider;
+use chrono::Utc;
 use common_time::interval::NANOS_PER_MILLI;
 use common_time::timestamp::TimeUnit;
 use common_time::{Interval, Timestamp, Timezone};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::prelude::Column;
 use datafusion::scalar::ScalarValue;
-use datafusion_common::tree_node::{TreeNode, TreeNodeRewriter, VisitRecursion};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter};
 use datafusion_common::{DFSchema, DataFusionError, Result as DFResult};
-use datafusion_expr::expr::ScalarUDF;
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::{
     Aggregate, Analyze, Explain, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
     Projection,
 };
+use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datatypes::prelude::ConcreteDataType;
 use promql_parser::util::parse_duration;
 use session::context::QueryContextRef;
@@ -109,34 +112,84 @@ fn parse_expr_to_string(args: &[Expr], i: usize) -> DFResult<String> {
 /// Parse a duraion expr:
 /// 1. duration string (e.g. `'1h'`)
 /// 2. Interval expr (e.g. `INTERVAL '1 year 3 hours 20 minutes'`)
+/// 3. An interval expr can be evaluated at the logical plan stage (e.g. `INTERVAL '2' day - INTERVAL '1' day`)
 fn parse_duration_expr(args: &[Expr], i: usize) -> DFResult<Duration> {
-    let interval_to_duration = |interval: Interval| -> Duration {
-        Duration::from_millis((interval.to_nanosecond() / NANOS_PER_MILLI as i128) as u64)
-    };
     match args.get(i) {
         Some(Expr::Literal(ScalarValue::Utf8(Some(str)))) => {
             parse_duration(str).map_err(DataFusionError::Plan)
         }
-        Some(Expr::Literal(ScalarValue::IntervalYearMonth(Some(i)))) => {
-            Ok(interval_to_duration(Interval::from_i32(*i)))
+        Some(expr) => {
+            let ms = evaluate_expr_to_millisecond(args, i, true)?;
+            if ms <= 0 {
+                return Err(dispose_parse_error(Some(expr)));
+            }
+            Ok(Duration::from_millis(ms as u64))
         }
-        Some(Expr::Literal(ScalarValue::IntervalDayTime(Some(i)))) => {
-            Ok(interval_to_duration(Interval::from_i64(*i)))
-        }
-        Some(Expr::Literal(ScalarValue::IntervalMonthDayNano(Some(i)))) => {
-            Ok(interval_to_duration(Interval::from_i128(*i)))
-        }
-        other => Err(dispose_parse_error(other)),
+        None => Err(dispose_parse_error(None)),
     }
+}
+
+/// Evaluate a time calculation expr, case like:
+/// 1. `INTERVAL '1' day + INTERVAL '1 year 2 hours 3 minutes'`
+/// 2. `now() - INTERVAL '1' day` (when `interval_only==false`)
+///
+/// Output a millisecond timestamp
+///
+/// if `interval_only==true`, only accept expr with all interval type (case 2 will return a error)
+fn evaluate_expr_to_millisecond(args: &[Expr], i: usize, interval_only: bool) -> DFResult<i64> {
+    let Some(expr) = args.get(i) else {
+        return Err(dispose_parse_error(None));
+    };
+    if interval_only && !interval_only_in_expr(expr) {
+        return Err(dispose_parse_error(Some(expr)));
+    }
+    let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
+    let info = SimplifyContext::new(&execution_props).with_schema(Arc::new(DFSchema::empty()));
+    let interval_to_ms =
+        |interval: Interval| -> i64 { (interval.to_nanosecond() / NANOS_PER_MILLI as i128) as i64 };
+    let simplify_expr = ExprSimplifier::new(info).simplify(expr.clone())?;
+    match simplify_expr {
+        Expr::Literal(ScalarValue::TimestampNanosecond(ts_nanos, _))
+        | Expr::Literal(ScalarValue::DurationNanosecond(ts_nanos)) => {
+            ts_nanos.map(|v| v / 1_000_000)
+        }
+        Expr::Literal(ScalarValue::TimestampMicrosecond(ts_micros, _))
+        | Expr::Literal(ScalarValue::DurationMicrosecond(ts_micros)) => {
+            ts_micros.map(|v| v / 1_000)
+        }
+        Expr::Literal(ScalarValue::TimestampMillisecond(ts_millis, _))
+        | Expr::Literal(ScalarValue::DurationMillisecond(ts_millis)) => ts_millis,
+        Expr::Literal(ScalarValue::TimestampSecond(ts_secs, _))
+        | Expr::Literal(ScalarValue::DurationSecond(ts_secs)) => ts_secs.map(|v| v * 1_000),
+        Expr::Literal(ScalarValue::IntervalYearMonth(interval)) => {
+            interval.map(|v| interval_to_ms(Interval::from_i32(v)))
+        }
+        Expr::Literal(ScalarValue::IntervalDayTime(interval)) => {
+            interval.map(|v| interval_to_ms(Interval::from_i64(v)))
+        }
+        Expr::Literal(ScalarValue::IntervalMonthDayNano(interval)) => {
+            interval.map(|v| interval_to_ms(Interval::from_i128(v)))
+        }
+        _ => None,
+    }
+    .ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{} is not a expr can be evaluate and use in range query",
+            expr.display_name().unwrap_or_default()
+        ))
+    })
 }
 
 /// Parse the `align to` clause and return a UTC timestamp with unit of millisecond,
 /// which is used as the basis for dividing time slot during the align operation.
 /// 1. NOW: align to current execute time
 /// 2. Timestamp string: align to specific timestamp
-/// 3. leave empty (as Default Option): align to unix epoch 0 (timezone aware)
+/// 3. An expr can be evaluated at the logical plan stage (e.g. `now() - INTERVAL '1' day`)
+/// 4. leave empty (as Default Option): align to unix epoch 0 (timezone aware)
 fn parse_align_to(args: &[Expr], i: usize, timezone: Option<&Timezone>) -> DFResult<i64> {
-    let s = parse_str_expr(args, i)?;
+    let Ok(s) = parse_str_expr(args, i) else {
+        return evaluate_expr_to_millisecond(args, i, false);
+    };
     let upper = s.to_uppercase();
     match upper.as_str() {
         "NOW" => return Ok(Timestamp::current_millis().value()),
@@ -163,11 +216,7 @@ fn parse_expr_list(args: &[Expr], start: usize, len: usize) -> DFResult<Vec<Expr
     for i in start..start + len {
         outs.push(match &args.get(i) {
             Some(
-                Expr::Column(_)
-                | Expr::Literal(_)
-                | Expr::BinaryExpr(_)
-                | Expr::ScalarFunction(_)
-                | Expr::ScalarUDF(_),
+                Expr::Column(_) | Expr::Literal(_) | Expr::BinaryExpr(_) | Expr::ScalarFunction(_),
             ) => args[i].clone(),
             other => {
                 return Err(dispose_parse_error(*other));
@@ -195,11 +244,11 @@ macro_rules! inconsistent_check {
 }
 
 impl<'a> TreeNodeRewriter for RangeExprRewriter<'a> {
-    type N = Expr;
+    type Node = Expr;
 
-    fn mutate(&mut self, node: Expr) -> DFResult<Expr> {
-        if let Expr::ScalarUDF(func) = &node {
-            if func.fun.name == "range_fn" {
+    fn f_down(&mut self, node: Expr) -> DFResult<Transformed<Expr>> {
+        if let Expr::ScalarFunction(func) = &node {
+            if func.name() == "range_fn" {
                 // `range_fn(func, range, fill, byc, [byv], align, to)`
                 // `[byv]` are variadic arguments, byc indicate the length of arguments
                 let range_expr = self.get_range_expr(&func.args, 0)?;
@@ -208,11 +257,8 @@ impl<'a> TreeNodeRewriter for RangeExprRewriter<'a> {
                     .map_err(|e| DataFusionError::Plan(e.to_string()))?;
                 let by = parse_expr_list(&func.args, 4, byc)?;
                 let align = parse_duration_expr(&func.args, byc + 4)?;
-                let align_to = parse_align_to(
-                    &func.args,
-                    byc + 5,
-                    Some(self.query_ctx.timezone().as_ref()),
-                )?;
+                let align_to =
+                    parse_align_to(&func.args, byc + 5, Some(&self.query_ctx.timezone()))?;
                 let mut data_type = range_expr.get_type(self.input_plan.schema())?;
                 let mut need_cast = false;
                 let fill = Fill::try_from_str(parse_str_expr(&func.args, 2)?, &data_type)?;
@@ -246,10 +292,10 @@ impl<'a> TreeNodeRewriter for RangeExprRewriter<'a> {
                 };
                 let alias = Expr::Column(Column::from_name(range_fn.name.clone()));
                 self.range_fn.insert(range_fn);
-                return Ok(alias);
+                return Ok(Transformed::yes(alias));
             }
         }
-        Ok(node)
+        Ok(Transformed::no(node))
     }
 }
 
@@ -317,7 +363,7 @@ impl RangePlanRewriter {
                 };
                 let new_expr = expr
                     .iter()
-                    .map(|expr| expr.clone().rewrite(&mut range_rewriter))
+                    .map(|expr| expr.clone().rewrite(&mut range_rewriter).map(|x| x.data))
                     .collect::<DFResult<Vec<_>>>()
                     .context(DataFusionSnafu)?;
                 if range_rewriter.by.is_empty() {
@@ -385,7 +431,7 @@ impl RangePlanRewriter {
                                 .context(DataFusionSnafu)?
                                 .build()
                         }
-                        _ => plan.with_new_inputs(&inputs),
+                        _ => plan.with_new_exprs(plan.expressions(), inputs),
                     }
                     .context(DataFusionSnafu)?;
                     Ok(Some(plan))
@@ -401,10 +447,11 @@ impl RangePlanRewriter {
     /// If the user does not explicitly use the `by` keyword to indicate time series,
     /// `[row_columns]` will be use as default time series
     async fn get_index_by(&mut self, schema: &Arc<DFSchema>) -> Result<(Expr, Vec<Expr>)> {
-        let mut time_index_expr = Expr::Wildcard;
+        let mut time_index_expr = Expr::Wildcard { qualifier: None };
         let mut default_by = vec![];
-        for field in schema.fields() {
-            if let Some(table_ref) = field.qualifier() {
+        for i in 0..schema.fields().len() {
+            let (qualifier, _) = schema.qualified_field(i);
+            if let Some(table_ref) = qualifier {
                 let table = self
                     .table_provider
                     .resolve_table(table_ref.clone())
@@ -446,7 +493,7 @@ impl RangePlanRewriter {
                 }
             }
         }
-        if time_index_expr == Expr::Wildcard {
+        if matches!(time_index_expr, Expr::Wildcard { .. }) {
             TimeIndexNotFoundSnafu {
                 table: schema.to_string(),
             }
@@ -460,17 +507,36 @@ impl RangePlanRewriter {
 fn have_range_in_exprs(exprs: &[Expr]) -> bool {
     exprs.iter().any(|expr| {
         let mut find_range = false;
-        let _ = expr.apply(&mut |expr| {
-            if let Expr::ScalarUDF(ScalarUDF { fun, .. }) = expr {
-                if fun.name == "range_fn" {
+        let _ = expr.apply(|expr| {
+            Ok(match expr {
+                Expr::ScalarFunction(func) if func.name() == "range_fn" => {
                     find_range = true;
-                    return Ok(VisitRecursion::Stop);
+                    TreeNodeRecursion::Stop
                 }
-            }
-            Ok(VisitRecursion::Continue)
+                _ => TreeNodeRecursion::Continue,
+            })
         });
         find_range
     })
+}
+
+fn interval_only_in_expr(expr: &Expr) -> bool {
+    let mut all_interval = true;
+    let _ = expr.apply(|expr| {
+        if !matches!(
+            expr,
+            Expr::Literal(ScalarValue::IntervalDayTime(_))
+                | Expr::Literal(ScalarValue::IntervalMonthDayNano(_))
+                | Expr::Literal(ScalarValue::IntervalYearMonth(_))
+                | Expr::BinaryExpr(_)
+        ) {
+            all_interval = false;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    all_interval
 }
 
 #[cfg(test)]
@@ -481,6 +547,7 @@ mod test {
     use catalog::memory::MemoryCatalogManager;
     use catalog::RegisterTableRequest;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use datafusion_expr::{BinaryExpr, Operator};
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema};
     use session::context::QueryContext;
@@ -541,7 +608,7 @@ mod test {
                 table,
             })
             .is_ok());
-        QueryEngineFactory::new(catalog_list, None, None, None, false).query_engine()
+        QueryEngineFactory::new(catalog_list, None, None, None, None, false).query_engine()
     }
 
     async fn do_query(sql: &str) -> Result<crate::plan::LogicalPlan> {
@@ -581,8 +648,8 @@ mod test {
         let query =
             r#"SELECT (covar(field_0 + field_1, field_1)/4) RANGE '5m' FROM test ALIGN '1h';"#;
         let expected = String::from(
-            "Projection: COVARIANCE(test.field_0 + test.field_1,test.field_1) RANGE 5m / Int64(4) [COVARIANCE(test.field_0 + test.field_1,test.field_1) RANGE 5m / Int64(4):Float64;N]\
-            \n  RangeSelect: range_exprs=[COVARIANCE(test.field_0 + test.field_1,test.field_1) RANGE 5m], align=3600000ms, align_to=0ms, align_by=[test.tag_0, test.tag_1, test.tag_2, test.tag_3, test.tag_4], time_index=timestamp [COVARIANCE(test.field_0 + test.field_1,test.field_1) RANGE 5m:Float64;N, timestamp:Timestamp(Millisecond, None), tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, tag_4:Utf8]\
+            "Projection: covar_samp(test.field_0 + test.field_1,test.field_1) RANGE 5m / Int64(4) [covar_samp(test.field_0 + test.field_1,test.field_1) RANGE 5m / Int64(4):Float64;N]\
+            \n  RangeSelect: range_exprs=[covar_samp(test.field_0 + test.field_1,test.field_1) RANGE 5m], align=3600000ms, align_to=0ms, align_by=[test.tag_0, test.tag_1, test.tag_2, test.tag_3, test.tag_4], time_index=timestamp [covar_samp(test.field_0 + test.field_1,test.field_1) RANGE 5m:Float64;N, timestamp:Timestamp(Millisecond, None), tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, tag_4:Utf8]\
             \n    TableScan: test [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, tag_4:Utf8, timestamp:Timestamp(Millisecond, None), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N, field_3:Float64;N, field_4:Float64;N]"
         );
         query_plan_compare(query, expected).await;
@@ -662,7 +729,7 @@ mod test {
     async fn complex_range_expr() {
         let query = r#"SELECT gcd(CAST(max(field_0 + 1) Range '5m' FILL NULL AS Int64), CAST(tag_0 AS Int64)) + round(max(field_2+1) Range '6m' FILL NULL + 1) + max(field_2+3) Range '10m' FILL NULL * CAST(tag_1 AS Float64) + 1 FROM test ALIGN '1h' by (tag_0, tag_1);"#;
         let expected = String::from(
-            "Projection: gcd(CAST(MAX(test.field_0 + Int64(1)) RANGE 5m FILL NULL AS Int64), CAST(test.tag_0 AS Int64)) + round(MAX(test.field_2 + Int64(1)) RANGE 6m FILL NULL + Int64(1)) + MAX(test.field_2 + Int64(3)) RANGE 10m FILL NULL * CAST(test.tag_1 AS Float64) + Int64(1) [gcd(MAX(test.field_0 + Int64(1)) RANGE 5m FILL NULL,test.tag_0) + round(MAX(test.field_2 + Int64(1)) RANGE 6m FILL NULL + Int64(1)) + MAX(test.field_2 + Int64(3)) RANGE 10m FILL NULL * test.tag_1 + Int64(1):Float64;N]\
+            "Projection: gcd(arrow_cast(MAX(test.field_0 + Int64(1)) RANGE 5m FILL NULL, Utf8(\"Int64\")), arrow_cast(test.tag_0, Utf8(\"Int64\"))) + round(MAX(test.field_2 + Int64(1)) RANGE 6m FILL NULL + Int64(1)) + MAX(test.field_2 + Int64(3)) RANGE 10m FILL NULL * arrow_cast(test.tag_1, Utf8(\"Float64\")) + Int64(1) [gcd(arrow_cast(MAX(test.field_0 + Int64(1)) RANGE 5m FILL NULL,Utf8(\"Int64\")),arrow_cast(test.tag_0,Utf8(\"Int64\"))) + round(MAX(test.field_2 + Int64(1)) RANGE 6m FILL NULL + Int64(1)) + MAX(test.field_2 + Int64(3)) RANGE 10m FILL NULL * arrow_cast(test.tag_1,Utf8(\"Float64\")) + Int64(1):Float64;N]\
             \n  RangeSelect: range_exprs=[MAX(test.field_0 + Int64(1)) RANGE 5m FILL NULL, MAX(test.field_2 + Int64(1)) RANGE 6m FILL NULL, MAX(test.field_2 + Int64(3)) RANGE 10m FILL NULL], align=3600000ms, align_to=0ms, align_by=[test.tag_0, test.tag_1], time_index=timestamp [MAX(test.field_0 + Int64(1)) RANGE 5m FILL NULL:Float64;N, MAX(test.field_2 + Int64(1)) RANGE 6m FILL NULL:Float64;N, MAX(test.field_2 + Int64(3)) RANGE 10m FILL NULL:Float64;N, timestamp:Timestamp(Millisecond, None), tag_0:Utf8, tag_1:Utf8]\
             \n    TableScan: test [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, tag_4:Utf8, timestamp:Timestamp(Millisecond, None), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N, field_3:Float64;N, field_4:Float64;N]"
         );
@@ -673,7 +740,7 @@ mod test {
     async fn range_linear_on_integer() {
         let query = r#"SELECT min(CAST(field_0 AS Int64) + CAST(field_1 AS Int64)) RANGE '5m' FILL LINEAR FROM test ALIGN '1h' by (tag_0,tag_1);"#;
         let expected = String::from(
-            "RangeSelect: range_exprs=[MIN(test.field_0 + test.field_1) RANGE 5m FILL LINEAR], align=3600000ms, align_to=0ms, align_by=[test.tag_0, test.tag_1], time_index=timestamp [MIN(test.field_0 + test.field_1) RANGE 5m FILL LINEAR:Float64;N]\
+            "RangeSelect: range_exprs=[MIN(arrow_cast(test.field_0,Utf8(\"Int64\")) + arrow_cast(test.field_1,Utf8(\"Int64\"))) RANGE 5m FILL LINEAR], align=3600000ms, align_to=0ms, align_by=[test.tag_0, test.tag_1], time_index=timestamp [MIN(arrow_cast(test.field_0,Utf8(\"Int64\")) + arrow_cast(test.field_1,Utf8(\"Int64\"))) RANGE 5m FILL LINEAR:Float64;N]\
             \n  TableScan: test [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, tag_4:Utf8, timestamp:Timestamp(Millisecond, None), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N, field_3:Float64;N, field_4:Float64;N]"
         );
         query_plan_compare(query, expected).await;
@@ -758,8 +825,42 @@ mod test {
             parse_duration_expr(&args, 0).unwrap(),
             parse_duration("1y4w").unwrap()
         );
-        // test err
+        // test index err
         assert!(parse_duration_expr(&args, 10).is_err());
+        // test evaluate expr
+        let args = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+            op: Operator::Plus,
+            right: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+        })];
+        assert_eq!(
+            parse_duration_expr(&args, 0).unwrap().as_millis(),
+            interval_to_ms(Interval::from_year_month(20))
+        );
+        let args = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+            op: Operator::Minus,
+            right: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+        })];
+        // test zero interval error
+        assert!(parse_duration_expr(&args, 0).is_err());
+        // test must all be interval
+        let args = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+            op: Operator::Minus,
+            right: Box::new(Expr::Literal(ScalarValue::Time64Microsecond(Some(0)))),
+        })];
+        assert!(parse_duration_expr(&args, 0).is_err());
     }
 
     #[test]
@@ -791,19 +892,56 @@ mod test {
         let args = vec![Expr::Literal(ScalarValue::Utf8(Some(
             "1970-01-01T00:00:00+08:00".into(),
         )))];
-        assert!(parse_align_to(&args, 0, None).unwrap() == -8 * 60 * 60 * 1000);
+        assert_eq!(parse_align_to(&args, 0, None).unwrap(), -8 * 60 * 60 * 1000);
         // timezone
         let args = vec![Expr::Literal(ScalarValue::Utf8(Some(
             "1970-01-01T00:00:00".into(),
         )))];
-        assert!(
+        assert_eq!(
             parse_align_to(
                 &args,
                 0,
                 Some(&Timezone::from_tz_string("Asia/Shanghai").unwrap())
             )
-            .unwrap()
-                == -8 * 60 * 60 * 1000
+            .unwrap(),
+            -8 * 60 * 60 * 1000
         );
+        // test evaluate expr
+        let args = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+            op: Operator::Plus,
+            right: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+        })];
+        assert_eq!(
+            parse_align_to(&args, 0, None).unwrap(),
+            // 20 month
+            20 * 30 * 24 * 60 * 60 * 1000
+        );
+    }
+
+    #[test]
+    fn test_interval_only() {
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Literal(ScalarValue::DurationMillisecond(Some(20)))),
+            op: Operator::Minus,
+            right: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+        });
+        assert!(!interval_only_in_expr(&expr));
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+            op: Operator::Minus,
+            right: Box::new(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
+                Interval::from_year_month(10).to_i32(),
+            )))),
+        });
+        assert!(interval_only_in_expr(&expr));
     }
 }

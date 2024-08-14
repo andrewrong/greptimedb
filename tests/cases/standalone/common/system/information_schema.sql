@@ -2,6 +2,8 @@
 create database information_schema;
 
 -- scripts table has different table ids in different modes
+-- SQLNESS REPLACE (\s[\-0-9T:\.]{15,}) DATETIME
+-- SQLNESS REPLACE [\u0020\-]+
 select *
 from information_schema.tables
 where table_name != 'scripts'
@@ -36,7 +38,7 @@ order by table_name;
 
 select table_name
 from information_schema.tables
-where table_schema not in ('my_db', 'information_schema')
+where table_schema not in ('my_db', 'information_schema', 'pg_catalog')
 order by table_name;
 
 select table_catalog, table_schema, table_name, table_type, engine
@@ -44,6 +46,7 @@ from information_schema.tables
 where table_catalog = 'greptime'
   and table_schema != 'public'
   and table_schema != 'information_schema'
+  and table_schema != 'pg_catalog'
 order by table_schema, table_name;
 
 select table_catalog, table_schema, table_name, column_name, data_type, semantic_type
@@ -51,6 +54,7 @@ from information_schema.columns
 where table_catalog = 'greptime'
   and table_schema != 'public'
   and table_schema != 'information_schema'
+  and table_schema != 'pg_catalog'
 order by table_schema, table_name, column_name;
 
 -- test query filter for columns --
@@ -117,7 +121,11 @@ SELECT * FROM CHECK_CONSTRAINTS;
 
 DESC TABLE RUNTIME_METRICS;
 
-DESC TABLE GREPTIME_REGION_PEERS;
+DESC TABLE REGION_PEERS;
+
+USE INFORMATION_SCHEMA;
+
+DESC COLUMNS;
 
 drop table my_db.foo;
 

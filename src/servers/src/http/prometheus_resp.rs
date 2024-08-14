@@ -26,15 +26,18 @@ use datatypes::prelude::ConcreteDataType;
 use datatypes::scalars::ScalarVector;
 use datatypes::vectors::{Float64Vector, StringVector, TimestampMillisecondVector};
 use promql_parser::label::METRIC_NAME;
-use promql_parser::parser::ValueType;
+use promql_parser::parser::value::ValueType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::{OptionExt, ResultExt};
 
 use super::header::{collect_plan_metrics, GREPTIME_DB_HEADER_METRICS};
-use super::prometheus::{PromData, PromSeries, PrometheusResponse};
-use crate::error::{CollectRecordbatchSnafu, InternalSnafu, Result};
+use super::prometheus::{
+    PromData, PromQueryResult, PromSeriesMatrix, PromSeriesVector, PrometheusResponse,
+};
+use crate::error::{CollectRecordbatchSnafu, Result, UnexpectedResultSnafu};
+use crate::http::error_result::status_code_to_http_status;
 
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct PrometheusJsonResponse {
@@ -48,6 +51,8 @@ pub struct PrometheusJsonResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
 
+    #[serde(skip)]
+    pub status_code: Option<StatusCode>,
     // placeholder for header value
     #[serde(skip)]
     #[serde(default)]
@@ -62,7 +67,13 @@ impl IntoResponse for PrometheusJsonResponse {
             serde_json::to_string(&self.resp_metrics).ok()
         };
 
+        let http_code = self.status_code.map(|c| status_code_to_http_status(&c));
+
         let mut resp = Json(self).into_response();
+
+        if let Some(http_code) = http_code {
+            *resp.status_mut() = http_code;
+        }
 
         if let Some(m) = metrics.and_then(|m| HeaderValue::from_str(&m).ok()) {
             resp.headers_mut().insert(&GREPTIME_DB_HEADER_METRICS, m);
@@ -73,18 +84,18 @@ impl IntoResponse for PrometheusJsonResponse {
 }
 
 impl PrometheusJsonResponse {
-    pub fn error<S1, S2>(error_type: S1, reason: S2) -> Self
+    pub fn error<S1>(error_type: StatusCode, reason: S1) -> Self
     where
         S1: Into<String>,
-        S2: Into<String>,
     {
         PrometheusJsonResponse {
             status: "error".to_string(),
             data: PrometheusResponse::default(),
             error: Some(reason.into()),
-            error_type: Some(error_type.into()),
+            error_type: Some(error_type.to_string()),
             warnings: None,
             resp_metrics: Default::default(),
+            status_code: Some(error_type),
         }
     }
 
@@ -96,6 +107,7 @@ impl PrometheusJsonResponse {
             error_type: None,
             warnings: None,
             resp_metrics: Default::default(),
+            status_code: None,
         }
     }
 
@@ -122,15 +134,16 @@ impl PrometheusJsonResponse {
                             result_type,
                         )?)
                     }
-                    OutputData::AffectedRows(_) => {
-                        Self::error("Unexpected", "expected data result, but got affected rows")
-                    }
+                    OutputData::AffectedRows(_) => Self::error(
+                        StatusCode::Unexpected,
+                        "expected data result, but got affected rows",
+                    ),
                 };
 
             if let Some(physical_plan) = result.meta.plan {
                 let mut result_map = HashMap::new();
                 let mut tmp = vec![&mut result_map];
-                collect_plan_metrics(physical_plan, &mut tmp);
+                collect_plan_metrics(&physical_plan, &mut tmp);
 
                 let re = result_map
                     .into_iter()
@@ -156,7 +169,7 @@ impl PrometheusJsonResponse {
                         ..Default::default()
                     }))
                 } else {
-                    Self::error(err.status_code().to_string(), err.output_msg())
+                    Self::error(err.status_code(), err.output_msg())
                 }
             }
         }
@@ -181,7 +194,17 @@ impl PrometheusJsonResponse {
                         timestamp_column_index = Some(i);
                     }
                 }
-                ConcreteDataType::Float64(_) => {
+                // Treat all value types as field
+                ConcreteDataType::Float32(_)
+                | ConcreteDataType::Float64(_)
+                | ConcreteDataType::Int8(_)
+                | ConcreteDataType::Int16(_)
+                | ConcreteDataType::Int32(_)
+                | ConcreteDataType::Int64(_)
+                | ConcreteDataType::UInt8(_)
+                | ConcreteDataType::UInt16(_)
+                | ConcreteDataType::UInt32(_)
+                | ConcreteDataType::UInt64(_) => {
                     if first_field_column_index.is_none() {
                         first_field_column_index = Some(i);
                     }
@@ -193,11 +216,11 @@ impl PrometheusJsonResponse {
             }
         }
 
-        let timestamp_column_index = timestamp_column_index.context(InternalSnafu {
-            err_msg: "no timestamp column found".to_string(),
+        let timestamp_column_index = timestamp_column_index.context(UnexpectedResultSnafu {
+            reason: "no timestamp column found".to_string(),
         })?;
-        let first_field_column_index = first_field_column_index.context(InternalSnafu {
-            err_msg: "no value column found".to_string(),
+        let first_field_column_index = first_field_column_index.context(UnexpectedResultSnafu {
+            reason: "no value column found".to_string(),
         })?;
 
         let metric_name = (METRIC_NAME.to_string(), metric_name);
@@ -224,8 +247,11 @@ impl PrometheusJsonResponse {
                 .as_any()
                 .downcast_ref::<TimestampMillisecondVector>()
                 .unwrap();
-            let field_column = batch
+            let casted_field_column = batch
                 .column(first_field_column_index)
+                .cast(&ConcreteDataType::float64_datatype())
+                .unwrap();
+            let field_column = casted_field_column
                 .as_any()
                 .downcast_ref::<Float64Vector>()
                 .unwrap();
@@ -256,24 +282,35 @@ impl PrometheusJsonResponse {
             }
         }
 
-        let result = buffer
-            .into_iter()
-            .map(|(tags, mut values)| {
-                let metric = tags.into_iter().collect();
-                match result_type {
-                    ValueType::Vector | ValueType::Scalar | ValueType::String => Ok(PromSeries {
+        // initialize result to return
+        let mut result = match result_type {
+            ValueType::Vector => PromQueryResult::Vector(vec![]),
+            ValueType::Matrix => PromQueryResult::Matrix(vec![]),
+            ValueType::Scalar => PromQueryResult::Scalar(None),
+            ValueType::String => PromQueryResult::String(None),
+        };
+
+        // accumulate data into result
+        buffer.into_iter().for_each(|(tags, mut values)| {
+            let metric = tags.into_iter().collect();
+            match result {
+                PromQueryResult::Vector(ref mut v) => {
+                    v.push(PromSeriesVector {
                         metric,
                         value: values.pop(),
-                        ..Default::default()
-                    }),
-                    ValueType::Matrix => Ok(PromSeries {
-                        metric,
-                        values,
-                        ..Default::default()
-                    }),
+                    });
                 }
-            })
-            .collect::<Result<Vec<_>>>()?;
+                PromQueryResult::Matrix(ref mut v) => {
+                    v.push(PromSeriesMatrix { metric, values });
+                }
+                PromQueryResult::Scalar(ref mut v) => {
+                    *v = values.pop();
+                }
+                PromQueryResult::String(ref mut _v) => {
+                    // TODO(ruihang): Not supported yet
+                }
+            }
+        });
 
         let result_type_string = result_type.to_string();
         let data = PrometheusResponse::PromData(PromData {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::env;
+use std::sync::Arc;
 use std::time::Instant;
 
 use aide::transform::TransformOperation;
@@ -26,11 +26,11 @@ use common_plugins::GREPTIME_EXEC_WRITE_COST;
 use common_query::{Output, OutputData};
 use common_recordbatch::util;
 use common_telemetry::tracing;
-use query::parser::PromQuery;
+use query::parser::{PromQuery, DEFAULT_LOOKBACK_STRING};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use session::context::QueryContextRef;
+use session::context::{Channel, QueryContext, QueryContextRef};
 
 use super::header::collect_plan_metrics;
 use crate::http::arrow_result::ArrowResponse;
@@ -38,6 +38,7 @@ use crate::http::csv_result::CsvResponse;
 use crate::http::error_result::ErrorResponse;
 use crate::http::greptime_result_v1::GreptimedbV1Response;
 use crate::http::influxdb_result_v1::InfluxdbV1Response;
+use crate::http::table_result::TableResponse;
 use crate::http::{
     ApiState, Epoch, GreptimeOptionsConfigState, GreptimeQueryOutput, HttpRecordsOutput,
     HttpResponse, ResponseFormat,
@@ -61,6 +62,7 @@ pub struct SqlQuery {
     // specified time precision. Maybe greptimedb format can support this
     // param too.
     pub epoch: Option<String>,
+    pub limit: Option<usize>,
 }
 
 /// Handler to execute sql
@@ -69,12 +71,15 @@ pub struct SqlQuery {
 pub async fn sql(
     State(state): State<ApiState>,
     Query(query_params): Query<SqlQuery>,
-    Extension(query_ctx): Extension<QueryContextRef>,
+    Extension(mut query_ctx): Extension<QueryContext>,
     Form(form_params): Form<SqlQuery>,
 ) -> HttpResponse {
     let start = Instant::now();
     let sql_handler = &state.sql_handler;
     let db = query_ctx.get_db_string();
+
+    query_ctx.set_channel(Channel::Http);
+    let query_ctx = Arc::new(query_ctx);
 
     let _timer = crate::metrics::METRIC_HTTP_SQL_ELAPSED
         .with_label_values(&[db.as_str()])
@@ -97,7 +102,7 @@ pub async fn sql(
         if let Some((status, msg)) = validate_schema(sql_handler.clone(), query_ctx.clone()).await {
             Err((status, msg))
         } else {
-            Ok(sql_handler.do_query(sql, query_ctx).await)
+            Ok(sql_handler.do_query(sql, query_ctx.clone()).await)
         }
     } else {
         Err((
@@ -109,26 +114,29 @@ pub async fn sql(
     let outputs = match result {
         Err((status, msg)) => {
             return HttpResponse::Error(
-                ErrorResponse::from_error_message(format, status, msg)
+                ErrorResponse::from_error_message(status, msg)
                     .with_execution_time(start.elapsed().as_millis() as u64),
             );
         }
         Ok(outputs) => outputs,
     };
 
-    let resp = match format {
+    let mut resp = match format {
         ResponseFormat::Arrow => ArrowResponse::from_output(outputs).await,
         ResponseFormat::Csv => CsvResponse::from_output(outputs).await,
+        ResponseFormat::Table => TableResponse::from_output(outputs).await,
         ResponseFormat::GreptimedbV1 => GreptimedbV1Response::from_output(outputs).await,
         ResponseFormat::InfluxdbV1 => InfluxdbV1Response::from_output(outputs, epoch).await,
     };
 
+    if let Some(limit) = query_params.limit {
+        resp = resp.with_limit(limit);
+    }
     resp.with_execution_time(start.elapsed().as_millis() as u64)
 }
 
 /// Create a response from query result
 pub async fn from_output(
-    ty: ResponseFormat,
     outputs: Vec<crate::error::Result<Output>>,
 ) -> Result<(Vec<GreptimeQueryOutput>, HashMap<String, Value>), ErrorResponse> {
     // TODO(sunng87): this api response structure cannot represent error well.
@@ -152,18 +160,18 @@ pub async fn from_output(
                         Ok(rows) => match HttpRecordsOutput::try_new(schema, rows) {
                             Ok(rows) => rows,
                             Err(err) => {
-                                return Err(ErrorResponse::from_error(ty, err));
+                                return Err(ErrorResponse::from_error(err));
                             }
                         },
                         Err(err) => {
-                            return Err(ErrorResponse::from_error(ty, err));
+                            return Err(ErrorResponse::from_error(err));
                         }
                     };
                     if let Some(physical_plan) = o.meta.plan {
                         let mut result_map = HashMap::new();
 
                         let mut tmp = vec![&mut merge_map, &mut result_map];
-                        collect_plan_metrics(physical_plan, &mut tmp);
+                        collect_plan_metrics(&physical_plan, &mut tmp);
                         let re = result_map
                             .into_iter()
                             .map(|(k, v)| (k, Value::from(v)))
@@ -178,14 +186,14 @@ pub async fn from_output(
                             results.push(GreptimeQueryOutput::Records(rows));
                         }
                         Err(err) => {
-                            return Err(ErrorResponse::from_error(ty, err));
+                            return Err(ErrorResponse::from_error(err));
                         }
                     }
                 }
             },
 
             Err(err) => {
-                return Err(ErrorResponse::from_error(ty, err));
+                return Err(ErrorResponse::from_error(err));
             }
         }
     }
@@ -204,6 +212,7 @@ pub struct PromqlQuery {
     pub start: String,
     pub end: String,
     pub step: String,
+    pub lookback: Option<String>,
     pub db: Option<String>,
 }
 
@@ -214,6 +223,9 @@ impl From<PromqlQuery> for PromQuery {
             start: query.start,
             end: query.end,
             step: query.step,
+            lookback: query
+                .lookback
+                .unwrap_or_else(|| DEFAULT_LOOKBACK_STRING.to_string()),
         }
     }
 }
@@ -224,11 +236,14 @@ impl From<PromqlQuery> for PromQuery {
 pub async fn promql(
     State(state): State<ApiState>,
     Query(params): Query<PromqlQuery>,
-    Extension(query_ctx): Extension<QueryContextRef>,
+    Extension(mut query_ctx): Extension<QueryContext>,
 ) -> Response {
     let sql_handler = &state.sql_handler;
     let exec_start = Instant::now();
     let db = query_ctx.get_db_string();
+
+    query_ctx.set_channel(Channel::Http);
+    let query_ctx = Arc::new(query_ctx);
 
     let _timer = crate::metrics::METRIC_HTTP_PROMQL_ELAPSED
         .with_label_values(&[db.as_str()])
@@ -237,7 +252,7 @@ pub async fn promql(
     let resp = if let Some((status, msg)) =
         validate_schema(sql_handler.clone(), query_ctx.clone()).await
     {
-        let resp = ErrorResponse::from_error_message(ResponseFormat::GreptimedbV1, status, msg);
+        let resp = ErrorResponse::from_error_message(status, msg);
         HttpResponse::Error(resp)
     } else {
         let prom_query = params.into();
@@ -302,13 +317,14 @@ pub async fn status() -> Json<StatusResponse<'static>> {
     let hostname = hostname::get()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    let build_info = common_version::build_info();
     Json(StatusResponse {
-        source_time: env!("SOURCE_TIMESTAMP"),
-        commit: env!("GIT_COMMIT"),
-        branch: env!("GIT_BRANCH"),
-        rustc_version: env!("RUSTC_VERSION"),
+        source_time: build_info.source_time,
+        commit: build_info.commit,
+        branch: build_info.branch,
+        rustc_version: build_info.rustc,
         hostname,
-        version: env!("CARGO_PKG_VERSION"),
+        version: build_info.version,
     })
 }
 
@@ -323,7 +339,7 @@ async fn validate_schema(
     query_ctx: QueryContextRef,
 ) -> Option<(StatusCode, String)> {
     match sql_handler
-        .is_valid_schema(query_ctx.current_catalog(), query_ctx.current_schema())
+        .is_valid_schema(query_ctx.current_catalog(), &query_ctx.current_schema())
         .await
     {
         Ok(true) => None,

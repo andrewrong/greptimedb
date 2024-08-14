@@ -15,13 +15,15 @@
 use std::env;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use client::OutputData;
 use common_query::Output;
 use common_recordbatch::util;
 use common_telemetry::warn;
 use common_test_util::find_workspace_path;
-use common_wal::config::kafka::{DatanodeKafkaConfig, MetaSrvKafkaConfig};
-use common_wal::config::{DatanodeWalConfig, MetaSrvWalConfig};
+use common_wal::config::kafka::common::KafkaTopicConfig;
+use common_wal::config::kafka::{DatanodeKafkaConfig, MetasrvKafkaConfig};
+use common_wal::config::{DatanodeWalConfig, MetasrvWalConfig};
 use frontend::instance::Instance;
 use rstest_reuse::{self, template};
 
@@ -36,7 +38,8 @@ pub(crate) trait RebuildableMockInstance: MockInstance {
     async fn rebuild(&mut self);
 }
 
-pub(crate) trait MockInstance: Sync + Send {
+#[async_trait]
+pub trait MockInstance: Sync + Send {
     fn frontend(&self) -> Arc<Instance>;
 
     fn is_distributed_mode(&self) -> bool;
@@ -106,7 +109,7 @@ impl MockInstanceBuilder {
                     unreachable!()
                 };
                 let GreptimeDbStandalone {
-                    mix_options,
+                    opts,
                     guard,
                     kv_backend,
                     procedure_manager,
@@ -114,7 +117,7 @@ impl MockInstanceBuilder {
                 } = instance;
                 MockInstanceImpl::Standalone(
                     builder
-                        .build_with(kv_backend, procedure_manager, guard, mix_options)
+                        .build_with(kv_backend, guard, opts, procedure_manager, false)
                         .await,
                 )
             }
@@ -223,14 +226,17 @@ pub(crate) async fn standalone_with_kafka_wal() -> Option<Box<dyn RebuildableMoc
         .collect::<Vec<_>>();
     let test_name = uuid::Uuid::new_v4().to_string();
     let builder = GreptimeDbStandaloneBuilder::new(&test_name)
-        .with_wal_config(DatanodeWalConfig::Kafka(DatanodeKafkaConfig {
+        .with_datanode_wal_config(DatanodeWalConfig::Kafka(DatanodeKafkaConfig {
             broker_endpoints: endpoints.clone(),
             ..Default::default()
         }))
-        .with_meta_wal_config(MetaSrvWalConfig::Kafka(MetaSrvKafkaConfig {
+        .with_metasrv_wal_config(MetasrvWalConfig::Kafka(MetasrvKafkaConfig {
             broker_endpoints: endpoints,
-            topic_name_prefix: test_name.to_string(),
-            num_topics: 3,
+            kafka_topic: KafkaTopicConfig {
+                topic_name_prefix: test_name.to_string(),
+                num_topics: 3,
+                ..Default::default()
+            },
             ..Default::default()
         }));
     let instance = TestContext::new(MockInstanceBuilder::Standalone(builder)).await;
@@ -253,14 +259,17 @@ pub(crate) async fn distributed_with_kafka_wal() -> Option<Box<dyn RebuildableMo
     let test_name = uuid::Uuid::new_v4().to_string();
     let builder = GreptimeDbClusterBuilder::new(&test_name)
         .await
-        .with_wal_config(DatanodeWalConfig::Kafka(DatanodeKafkaConfig {
+        .with_datanode_wal_config(DatanodeWalConfig::Kafka(DatanodeKafkaConfig {
             broker_endpoints: endpoints.clone(),
             ..Default::default()
         }))
-        .with_meta_wal_config(MetaSrvWalConfig::Kafka(MetaSrvKafkaConfig {
+        .with_metasrv_wal_config(MetasrvWalConfig::Kafka(MetasrvKafkaConfig {
             broker_endpoints: endpoints,
-            topic_name_prefix: test_name.to_string(),
-            num_topics: 3,
+            kafka_topic: KafkaTopicConfig {
+                topic_name_prefix: test_name.to_string(),
+                num_topics: 3,
+                ..Default::default()
+            },
             ..Default::default()
         }));
     let instance = TestContext::new(MockInstanceBuilder::Distributed(builder)).await;
@@ -276,7 +285,7 @@ pub(crate) async fn distributed_with_kafka_wal() -> Option<Box<dyn RebuildableMo
 pub(crate) fn both_instances_cases_with_kafka_wal(
     #[future]
     #[case]
-    instance: Option<Box<dyn RebuildableMockInstance>>,
+    rebuildable_instance: Option<Box<dyn RebuildableMockInstance>>,
 ) {
 }
 

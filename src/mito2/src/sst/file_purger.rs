@@ -97,7 +97,6 @@ impl FilePurger for LocalFilePurger {
 mod tests {
     use common_test_util::temp_dir::create_temp_dir;
     use object_store::services::Fs;
-    use object_store::util::join_dir;
     use object_store::ObjectStore;
     use smallvec::SmallVec;
 
@@ -106,6 +105,7 @@ mod tests {
     use crate::schedule::scheduler::{LocalScheduler, Scheduler};
     use crate::sst::file::{FileHandle, FileId, FileMeta, FileTimeRange, IndexType};
     use crate::sst::index::intermediate::IntermediateManager;
+    use crate::sst::index::puffin_manager::PuffinManagerFactory;
     use crate::sst::location;
 
     #[tokio::test]
@@ -114,12 +114,16 @@ mod tests {
 
         let dir = create_temp_dir("file-purge");
         let dir_path = dir.path().display().to_string();
-        let mut builder = Fs::default();
-        builder.root(&dir_path);
+        let builder = Fs::default().root(&dir_path);
         let sst_file_id = FileId::random();
         let sst_dir = "table1";
         let path = location::sst_file_path(sst_dir, sst_file_id);
-        let intm_mgr = IntermediateManager::init_fs(join_dir(&dir_path, "intm"))
+
+        let index_aux_path = dir.path().join("index_aux");
+        let puffin_mgr = PuffinManagerFactory::new(&index_aux_path, 4096, None)
+            .await
+            .unwrap();
+        let intm_mgr = IntermediateManager::init_fs(index_aux_path.to_str().unwrap())
             .await
             .unwrap();
 
@@ -127,7 +131,12 @@ mod tests {
         object_store.write(&path, vec![0; 4096]).await.unwrap();
 
         let scheduler = Arc::new(LocalScheduler::new(3));
-        let layer = Arc::new(AccessLayer::new(sst_dir, object_store.clone(), intm_mgr));
+        let layer = Arc::new(AccessLayer::new(
+            sst_dir,
+            object_store.clone(),
+            puffin_mgr,
+            intm_mgr,
+        ));
 
         let file_purger = Arc::new(LocalFilePurger::new(scheduler.clone(), layer, None));
 
@@ -141,6 +150,8 @@ mod tests {
                     file_size: 4096,
                     available_indexes: Default::default(),
                     index_file_size: 0,
+                    num_rows: 0,
+                    num_row_groups: 0,
                 },
                 file_purger,
             );
@@ -159,15 +170,19 @@ mod tests {
 
         let dir = create_temp_dir("file-purge");
         let dir_path = dir.path().display().to_string();
-        let mut builder = Fs::default();
-        builder.root(&dir_path);
+        let builder = Fs::default().root(&dir_path);
         let sst_file_id = FileId::random();
         let sst_dir = "table1";
-        let intm_mgr = IntermediateManager::init_fs(join_dir(&dir_path, "intm"))
+
+        let index_aux_path = dir.path().join("index_aux");
+        let puffin_mgr = PuffinManagerFactory::new(&index_aux_path, 4096, None)
             .await
             .unwrap();
-        let path = location::sst_file_path(sst_dir, sst_file_id);
+        let intm_mgr = IntermediateManager::init_fs(index_aux_path.to_str().unwrap())
+            .await
+            .unwrap();
 
+        let path = location::sst_file_path(sst_dir, sst_file_id);
         let object_store = ObjectStore::new(builder).unwrap().finish();
         object_store.write(&path, vec![0; 4096]).await.unwrap();
 
@@ -178,7 +193,12 @@ mod tests {
             .unwrap();
 
         let scheduler = Arc::new(LocalScheduler::new(3));
-        let layer = Arc::new(AccessLayer::new(sst_dir, object_store.clone(), intm_mgr));
+        let layer = Arc::new(AccessLayer::new(
+            sst_dir,
+            object_store.clone(),
+            puffin_mgr,
+            intm_mgr,
+        ));
 
         let file_purger = Arc::new(LocalFilePurger::new(scheduler.clone(), layer, None));
 
@@ -192,6 +212,8 @@ mod tests {
                     file_size: 4096,
                     available_indexes: SmallVec::from_iter([IndexType::InvertedIndex]),
                     index_file_size: 4096,
+                    num_rows: 1024,
+                    num_row_groups: 1,
                 },
                 file_purger,
             );

@@ -12,30 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-
 use common_macro::admin_fn;
-use common_query::error::Error::ThreadJoin;
 use common_query::error::{
     InvalidFuncArgsSnafu, MissingTableMutationHandlerSnafu, Result, UnsupportedInputDataTypeSnafu,
 };
 use common_query::prelude::{Signature, Volatility};
-use common_telemetry::error;
 use datatypes::prelude::*;
-use datatypes::vectors::VectorRef;
 use session::context::QueryContextRef;
-use snafu::{ensure, Location, OptionExt};
+use snafu::ensure;
 use store_api::storage::RegionId;
 
-use crate::ensure_greptime;
-use crate::function::{Function, FunctionContext};
 use crate::handlers::TableMutationHandlerRef;
 use crate::helper::cast_u64;
 
 macro_rules! define_region_function {
     ($name: expr, $display_name_str: expr, $display_name: ident) => {
         /// A function to $display_name
-        #[admin_fn(name = $name, display_name = $display_name_str, sig_fn = "signature", ret = "uint64")]
+        #[admin_fn(name = $name, display_name = $display_name_str, sig_fn = signature, ret = uint64)]
         pub(crate) async fn $display_name(
             table_mutation_handler: &TableMutationHandlerRef,
             query_ctx: &QueryContextRef,
@@ -53,7 +46,7 @@ macro_rules! define_region_function {
 
             let Some(region_id) = cast_u64(&params[0])? else {
                 return UnsupportedInputDataTypeSnafu {
-                    function: $display_name_str,
+                    function: stringify!($display_name_str),
                     datatypes: params.iter().map(|v| v.data_type()).collect::<Vec<_>>(),
                 }
                 .fail();
@@ -68,9 +61,9 @@ macro_rules! define_region_function {
     };
 }
 
-define_region_function!("FlushRegionFunction", "flush_region", flush_region);
+define_region_function!(FlushRegionFunction, flush_region, flush_region);
 
-define_region_function!("CompactRegionFunction", "compact_region", compact_region);
+define_region_function!(CompactRegionFunction, compact_region, compact_region);
 
 fn signature() -> Signature {
     Signature::uniform(1, ConcreteDataType::numerics(), Volatility::Immutable)
@@ -84,6 +77,7 @@ mod tests {
     use datatypes::vectors::UInt64Vector;
 
     use super::*;
+    use crate::function::{Function, FunctionContext};
 
     macro_rules! define_region_function_test {
         ($name: ident, $func: ident) => {

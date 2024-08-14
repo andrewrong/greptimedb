@@ -45,19 +45,20 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let is_mutable_empty = region.version().memtables.mutable.is_empty();
 
         // Utilizes the short circuit evaluation.
-        let region = if !is_mutable_empty || region.manifest_manager.has_update().await? {
+        let region = if !is_mutable_empty || region.manifest_ctx.has_update().await? {
             info!("Reopening the region: {region_id}, empty mutable: {is_mutable_empty}");
             let reopened_region = Arc::new(
                 RegionOpener::new(
                     region_id,
                     region.region_dir(),
-                    self.memtable_builder.clone(),
+                    self.memtable_builder_provider.clone(),
                     self.object_store_manager.clone(),
-                    self.scheduler.clone(),
+                    self.purge_scheduler.clone(),
+                    self.puffin_manager_factory.clone(),
                     self.intermediate_manager.clone(),
                 )
                 .cache(Some(self.cache_manager.clone()))
-                .options(region.version().options.clone())
+                .options(region.version().options.clone())?
                 .skip_wal_replay(true)
                 .open(&self.config, &self.wal)
                 .await?,
@@ -73,13 +74,16 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let flushed_entry_id = region.version_control.current().last_entry_id;
         info!("Trying to replay memtable for region: {region_id}, flushed entry id: {flushed_entry_id}");
         let timer = Instant::now();
+        let wal_entry_reader = self.wal.wal_entry_reader(&region.provider, region_id);
+        let on_region_opened = self.wal.on_region_opened();
         let last_entry_id = replay_memtable(
-            &self.wal,
-            &region.wal_options,
+            &region.provider,
+            wal_entry_reader,
             region_id,
             flushed_entry_id,
             &region.version_control,
             self.config.allow_stale_entries,
+            on_region_opened,
         )
         .await?;
         info!(

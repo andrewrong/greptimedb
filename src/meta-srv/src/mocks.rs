@@ -18,7 +18,7 @@ use std::time::Duration;
 use api::v1::meta::heartbeat_server::HeartbeatServer;
 use api::v1::meta::procedure_service_server::ProcedureServiceServer;
 use api::v1::meta::store_server::StoreServer;
-use client::client_manager::DatanodeClients;
+use client::client_manager::NodeClients;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
 use common_meta::key::TableMetadataManager;
 use common_meta::kv_backend::etcd::EtcdStore;
@@ -26,14 +26,14 @@ use common_meta::kv_backend::memory::MemoryKvBackend;
 use common_meta::kv_backend::KvBackendRef;
 use tower::service_fn;
 
-use crate::metasrv::builder::MetaSrvBuilder;
-use crate::metasrv::{MetaSrv, MetaSrvOptions, SelectorRef};
+use crate::metasrv::builder::MetasrvBuilder;
+use crate::metasrv::{Metasrv, MetasrvOptions, SelectorRef};
 
 #[derive(Clone)]
 pub struct MockInfo {
     pub server_addr: String,
     pub channel_manager: ChannelManager,
-    pub meta_srv: MetaSrv,
+    pub metasrv: Metasrv,
 }
 
 pub async fn mock_with_memstore() -> MockInfo {
@@ -52,17 +52,17 @@ pub async fn mock_with_memstore_and_selector(selector: SelectorRef) -> MockInfo 
 }
 
 pub async fn mock(
-    opts: MetaSrvOptions,
+    opts: MetasrvOptions,
     kv_backend: KvBackendRef,
     selector: Option<SelectorRef>,
-    datanode_clients: Option<Arc<DatanodeClients>>,
+    datanode_clients: Option<Arc<NodeClients>>,
 ) -> MockInfo {
     let server_addr = opts.server_addr.clone();
     let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
 
     table_metadata_manager.init().await.unwrap();
 
-    let builder = MetaSrvBuilder::new().options(opts).kv_backend(kv_backend);
+    let builder = MetasrvBuilder::new().options(opts).kv_backend(kv_backend);
 
     let builder = match selector {
         Some(s) => builder.selector(s),
@@ -70,15 +70,15 @@ pub async fn mock(
     };
 
     let builder = match datanode_clients {
-        Some(clients) => builder.datanode_manager(clients),
+        Some(clients) => builder.node_manager(clients),
         None => builder,
     };
 
-    let meta_srv = builder.build().await.unwrap();
-    meta_srv.try_start().await.unwrap();
+    let metasrv = builder.build().await.unwrap();
+    metasrv.try_start().await.unwrap();
 
     let (client, server) = tokio::io::duplex(1024);
-    let service = meta_srv.clone();
+    let service = metasrv.clone();
     let _handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(HeartbeatServer::new(service.clone()))
@@ -119,6 +119,6 @@ pub async fn mock(
     MockInfo {
         server_addr,
         channel_manager,
-        meta_srv,
+        metasrv,
     }
 }

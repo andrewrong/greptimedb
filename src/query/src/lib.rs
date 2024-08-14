@@ -14,30 +14,32 @@
 
 #![feature(let_chains)]
 #![feature(int_roundings)]
+#![feature(option_get_or_insert_default)]
+#![feature(trait_upcasting)]
 
+mod analyze;
 pub mod dataframe;
 pub mod datafusion;
 pub mod dist_plan;
+pub mod dummy_catalog;
 pub mod error;
 pub mod executor;
-pub mod logical_optimizer;
 pub mod metrics;
 mod optimizer;
 pub mod parser;
-pub mod physical_optimizer;
-pub mod physical_planner;
 pub mod physical_wrapper;
 pub mod plan;
 pub mod planner;
+pub mod promql;
 pub mod query_engine;
 mod range_select;
 pub mod region_query;
 pub mod sql;
 
+#[cfg(test)]
+mod tests;
+
 pub use crate::datafusion::DfContextProviderAdapter;
 pub use crate::query_engine::{
     QueryEngine, QueryEngineContext, QueryEngineFactory, QueryEngineRef,
 };
-
-#[cfg(test)]
-mod tests;

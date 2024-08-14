@@ -22,7 +22,7 @@ arrow-ipc.workspace = true
 arrow-schema.workspace = true
 async-trait = "0.1"
 auth.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["multipart"] }
 axum-macros = "0.3.8"
 base64.workspace = true
 bytes.workspace = true
@@ -30,9 +30,9 @@ catalog.workspace = true
 chrono.workspace = true
 common-base.workspace = true
 common-catalog.workspace = true
+common-config.workspace = true
 common-error.workspace = true
 common-grpc.workspace = true
-common-grpc-expr.workspace = true
 common-macro.workspace = true
 common-mem-prof = { workspace = true, optional = true }
 common-meta.workspace = true
@@ -42,17 +42,17 @@ common-recordbatch.workspace = true
 common-runtime.workspace = true
 common-telemetry.workspace = true
 common-time.workspace = true
+common-version = { workspace = true, features = ["codec"] }
+dashmap.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
-datafusion-expr.workspace = true
 datatypes.workspace = true
 derive_builder.workspace = true
-digest = "0.10"
 futures = "0.3"
 hashbrown = "0.14"
 headers = "0.3"
-hex = { version = "0.4" }
-hostname = "0.3.1"
+hostname = "0.3"
+http = "0.2"
 http-body = "0.4"
 humantime-serde.workspace = true
 hyper = { version = "0.14", features = ["full"] }
@@ -60,15 +60,16 @@ influxdb_line_protocol = { git = "https://github.com/evenyag/influxdb_iox", bran
 itertools.workspace = true
 lazy_static.workspace = true
 mime_guess = "2.0"
-notify = "6.1"
+notify.workspace = true
 object-pool = "0.5"
 once_cell.workspace = true
 openmetrics-parser = "0.4"
 opensrv-mysql = "0.7.0"
 opentelemetry-proto.workspace = true
 parking_lot = "0.12"
-pgwire = "0.19.1"
+pgwire = "0.20"
 pin-project = "1.0"
+pipeline.workspace = true
 postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
 pprof = { version = "0.13", features = [
     "flamegraph",
@@ -76,7 +77,7 @@ pprof = { version = "0.13", features = [
     "protobuf",
 ], optional = true }
 prometheus.workspace = true
-promql-parser = "0.1.1"
+promql-parser.workspace = true
 prost.workspace = true
 query.workspace = true
 rand.workspace = true
@@ -86,12 +87,10 @@ rust-embed = { version = "6.6", features = ["debug-embed"] }
 rustls = "0.22"
 rustls-pemfile = "2.0"
 rustls-pki-types = "1.0"
-schemars = "0.8"
-secrecy = { version = "0.8", features = ["serde", "alloc"] }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
-sha1 = "0.10"
 snafu.workspace = true
 snap = "1"
 sql.workspace = true
@@ -100,23 +99,25 @@ table.workspace = true
 tokio.workspace = true
 tokio-rustls = "0.25"
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
 tonic.workspace = true
-tonic-reflection = "0.10"
-tower = { version = "0.4", features = ["full"] }
+tonic-reflection = "0.11"
+tower = { workspace = true, features = ["full"] }
 tower-http = { version = "0.4", features = ["full"] }
 urlencoding = "2.1"
+uuid.workspace = true
+zstd.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"] }
 
 [dev-dependencies]
 auth = { workspace = true, features = ["testing"] }
-axum-test-helper = "0.3"
 catalog = { workspace = true, features = ["testing"] }
-client.workspace = true
+client = { workspace = true, features = ["testing"] }
 common-base.workspace = true
 common-test-util.workspace = true
-criterion = "0.4"
+criterion = "0.5"
 mysql_async = { version = "0.33", default-features = false, features = [
     "default-rustls",
 ] }
@@ -131,9 +132,16 @@ tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.11"
 tokio-test = "0.4"
 
+[target.'cfg(not(windows))'.dev-dependencies]
+pprof = { version = "0.13", features = ["criterion", "flamegraph"] }
+
 [build-dependencies]
 common-version.workspace = true
 
 [[bench]]
 name = "bench_prom"
+harness = false
+
+[[bench]]
+name = "to_http_output"
 harness = false

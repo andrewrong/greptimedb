@@ -40,7 +40,6 @@ mod grpc;
 mod http;
 mod interceptor;
 mod mysql;
-mod opentsdb;
 mod postgres;
 mod py_script;
 
@@ -193,6 +192,7 @@ impl GrpcQueryHandler for DummyInstance {
                             start: promql.start,
                             end: promql.end,
                             step: promql.step,
+                            lookback: promql.lookback,
                         };
                         let mut result =
                             SqlQueryHandler::do_promql_query(self, &prom_query, ctx).await;
@@ -215,7 +215,7 @@ impl GrpcQueryHandler for DummyInstance {
 fn create_testing_instance(table: TableRef) -> DummyInstance {
     let catalog_manager = MemoryCatalogManager::new_with_table(table);
     let query_engine =
-        QueryEngineFactory::new(catalog_manager, None, None, None, false).query_engine();
+        QueryEngineFactory::new(catalog_manager, None, None, None, None, false).query_engine();
     DummyInstance::new(query_engine)
 }
 

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use ::auth::UserProviderRef;
 use axum::extract::State;
 use axum::http::{self, Request, StatusCode};
@@ -21,6 +19,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use common_base::secrets::SecretString;
 use common_catalog::consts::DEFAULT_SCHEMA_NAME;
 use common_catalog::parse_catalog_and_schema_from_db_string;
 use common_error::ext::ErrorExt;
@@ -28,12 +27,11 @@ use common_telemetry::warn;
 use common_time::timezone::parse_timezone;
 use common_time::Timezone;
 use headers::Header;
-use secrecy::SecretString;
 use session::context::QueryContextBuilder;
 use snafu::{ensure, OptionExt, ResultExt};
 
 use super::header::{GreptimeDbName, GREPTIME_TIMEZONE_HEADER_NAME};
-use super::{ResponseFormat, PUBLIC_APIS};
+use super::PUBLIC_APIS;
 use crate::error::{
     self, InvalidAuthHeaderInvisibleASCIISnafu, InvalidAuthHeaderSnafu, InvalidParameterSnafu,
     NotFoundInfluxAuthSnafu, Result, UnsupportedAuthSchemeSnafu, UrlDecodeSnafu,
@@ -62,10 +60,10 @@ pub async fn inner_auth<B>(
     // 1. prepare
     let (catalog, schema) = extract_catalog_and_schema(&req);
     // TODO(ruihang): move this out of auth module
-    let timezone = Arc::new(extract_timezone(&req));
+    let timezone = extract_timezone(&req);
     let query_ctx_builder = QueryContextBuilder::default()
-        .current_catalog(catalog.to_string())
-        .current_schema(schema.to_string())
+        .current_catalog(catalog.clone())
+        .current_schema(schema.clone())
         .timezone(timezone);
 
     let query_ctx = query_ctx_builder.build();
@@ -75,7 +73,7 @@ pub async fn inner_auth<B>(
     let user_provider = if let Some(user_provider) = user_provider.filter(|_| need_auth) {
         user_provider
     } else {
-        query_ctx.set_current_user(Some(auth::userinfo_by_name(None)));
+        query_ctx.set_current_user(auth::userinfo_by_name(None));
         let _ = req.extensions_mut().insert(query_ctx);
         return Ok(req);
     };
@@ -84,11 +82,11 @@ pub async fn inner_auth<B>(
     let (username, password) = match extract_username_and_password(&req) {
         Ok((username, password)) => (username, password),
         Err(e) => {
-            warn!("extract username and password failed: {}", e);
+            warn!(e; "extract username and password failed");
             crate::metrics::METRIC_AUTH_FAILURE
                 .with_label_values(&[e.status_code().as_ref()])
                 .inc();
-            return Err(err_response(is_influxdb_request(&req), e).into_response());
+            return Err(err_response(e));
         }
     };
 
@@ -97,22 +95,22 @@ pub async fn inner_auth<B>(
         .auth(
             auth::Identity::UserId(&username, None),
             auth::Password::PlainText(password),
-            catalog,
-            schema,
+            &catalog,
+            &schema,
         )
         .await
     {
         Ok(userinfo) => {
-            query_ctx.set_current_user(Some(userinfo));
+            query_ctx.set_current_user(userinfo);
             let _ = req.extensions_mut().insert(query_ctx);
             Ok(req)
         }
         Err(e) => {
-            warn!("authenticate failed: {}", e);
+            warn!(e; "authenticate failed");
             crate::metrics::METRIC_AUTH_FAILURE
                 .with_label_values(&[e.status_code().as_ref()])
                 .inc();
-            Err(err_response(is_influxdb_request(&req), e).into_response())
+            Err(err_response(e))
         }
     }
 }
@@ -128,16 +126,11 @@ pub async fn check_http_auth<B>(
     }
 }
 
-fn err_response(is_influxdb: bool, err: impl ErrorExt) -> impl IntoResponse {
-    let ty = if is_influxdb {
-        ResponseFormat::InfluxdbV1
-    } else {
-        ResponseFormat::GreptimedbV1
-    };
-    (StatusCode::UNAUTHORIZED, ErrorResponse::from_error(ty, err))
+fn err_response(err: impl ErrorExt) -> Response {
+    (StatusCode::UNAUTHORIZED, ErrorResponse::from_error(err)).into_response()
 }
 
-pub fn extract_catalog_and_schema<B>(request: &Request<B>) -> (&str, &str) {
+pub fn extract_catalog_and_schema<B>(request: &Request<B>) -> (String, String) {
     // parse database from header
     let dbname = request
         .headers()
@@ -325,7 +318,7 @@ fn extract_influxdb_user_from_query(query: &str) -> (Option<&str>, Option<&str>)
 mod tests {
     use std::assert_matches::assert_matches;
 
-    use secrecy::ExposeSecret;
+    use common_base::secrets::ExposeSecret;
 
     use super::*;
 
@@ -419,7 +412,7 @@ mod tests {
             .unwrap();
 
         let db = extract_catalog_and_schema(&req);
-        assert_eq!(db, ("greptime", "tomcat"));
+        assert_eq!(db, ("greptime".to_string(), "tomcat".to_string()));
     }
 
     #[test]

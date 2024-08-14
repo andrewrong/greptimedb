@@ -67,16 +67,22 @@ struct Args {
     /// If not set, sqlness will build GreptimeDB on the fly.
     #[clap(long)]
     bins_dir: Option<PathBuf>,
+
+    /// Preserve persistent state in the temporary directory.
+    /// This may affect future test runs.
+    #[clap(long)]
+    preserve_state: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    #[cfg(windows)]
-    let data_home = std::env::temp_dir();
-    #[cfg(not(windows))]
-    let data_home = std::path::PathBuf::from("/tmp");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("sqlness")
+        .tempdir()
+        .unwrap();
+    let data_home = temp_dir.into_path();
 
     let config = ConfigBuilder::default()
         .case_dir(util::get_case_dir(args.case_dir))
@@ -101,7 +107,13 @@ async fn main() {
 
     let runner = Runner::new(
         config,
-        Env::new(data_home, args.server_addr, wal, args.bins_dir),
+        Env::new(data_home.clone(), args.server_addr, wal, args.bins_dir),
     );
     runner.run().await.unwrap();
+
+    // clean up and exit
+    if !args.preserve_state {
+        println!("Removing state in {:?}", data_home);
+        tokio::fs::remove_dir_all(data_home).await.unwrap();
+    }
 }

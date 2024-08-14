@@ -22,8 +22,9 @@ use common_error::ext::{BoxedError, PlainError};
 use common_error::status_code::StatusCode;
 use common_telemetry::tracing;
 use promql_parser::parser::ast::{Extension as NodeExtension, ExtensionExpr};
+use promql_parser::parser::value::ValueType;
 use promql_parser::parser::Expr::Extension;
-use promql_parser::parser::{EvalStmt, Expr, ValueType};
+use promql_parser::parser::{EvalStmt, Expr};
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt};
 use sql::dialect::GreptimeDbDialect;
@@ -36,7 +37,6 @@ use crate::error::{
 };
 use crate::metrics::{PARSE_PROMQL_ELAPSED, PARSE_SQL_ELAPSED};
 
-const DEFAULT_LOOKBACK: u64 = 5 * 60; // 5m
 pub const DEFAULT_LOOKBACK_STRING: &str = "5m";
 pub const EXPLAIN_NODE_NAME: &str = "EXPLAIN";
 pub const EXPLAIN_VERBOSE_NODE_NAME: &str = "EXPLAIN VERBOSE";
@@ -98,6 +98,7 @@ pub struct PromQuery {
     pub start: String,
     pub end: String,
     pub step: String,
+    pub lookback: String,
 }
 
 impl Default for PromQuery {
@@ -107,6 +108,7 @@ impl Default for PromQuery {
             start: String::from("0"),
             end: String::from("0"),
             step: String::from("5m"),
+            lookback: String::from(DEFAULT_LOOKBACK_STRING),
         }
     }
 }
@@ -165,13 +167,22 @@ impl QueryLanguageParser {
                 query: &query.query,
             })?;
 
+        let lookback_delta = query
+            .lookback
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .or_else(|_| promql_parser::util::parse_duration(&query.lookback))
+            .map_err(|msg| BoxedError::new(PlainError::new(msg, StatusCode::InvalidArguments)))
+            .context(QueryParseSnafu {
+                query: &query.query,
+            })?;
+
         let eval_stmt = EvalStmt {
             expr,
             start,
             end,
             interval: step,
-            // TODO(ruihang): provide a way to adjust this parameter.
-            lookback_delta: Duration::from_secs(DEFAULT_LOOKBACK),
+            lookback_delta,
         };
 
         Ok(QueryStatement::Promql(eval_stmt))
@@ -295,9 +306,9 @@ mod test {
             sort_by: [], \
             having: None, \
             named_window: [], \
-            qualify: None \
-            }), order_by: [], limit: None, offset: None, fetch: None, locks: [] } }))");
-
+            qualify: None, \
+            value_table_mode: None \
+            }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None } }))");
         assert_eq!(format!("{stmt:?}"), expected);
     }
 
@@ -353,6 +364,7 @@ mod test {
             start: "2022-02-13T17:14:00Z".to_string(),
             end: "2023-02-13T17:14:00Z".to_string(),
             step: "1d".to_string(),
+            lookback: "5m".to_string(),
         };
 
         #[cfg(not(windows))]
@@ -361,8 +373,7 @@ mod test {
             Promql(EvalStmt { \
                 expr: VectorSelector(VectorSelector { \
                     name: Some(\"http_request\"), \
-                    matchers: Matchers { \
-                        matchers: [] }, \
+                    matchers: Matchers { matchers: [], or_matchers: [] }, \
                     offset: None, at: None }), \
                 start: SystemTime { tv_sec: 1644772440, tv_nsec: 0 }, \
                 end: SystemTime { tv_sec: 1676308440, tv_nsec: 0 }, \
@@ -378,7 +389,7 @@ mod test {
             Promql(EvalStmt { \
                 expr: VectorSelector(VectorSelector { \
                     name: Some(\"http_request\"), \
-                    matchers: Matchers { matchers: [] }, \
+                    matchers: Matchers { matchers: [], or_matchers: [] }, \
                     offset: None, at: None }), \
                 start: SystemTime { intervals: 132892460400000000 }, \
                 end: SystemTime { intervals: 133207820400000000 }, \

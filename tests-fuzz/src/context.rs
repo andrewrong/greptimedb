@@ -57,6 +57,11 @@ impl From<&CreateTableExpr> for TableContext {
 }
 
 impl TableContext {
+    /// Returns the timestamp column
+    pub fn timestamp_column(&self) -> Option<Column> {
+        self.columns.iter().find(|c| c.is_time_index()).cloned()
+    }
+
     /// Applies the [AlterTableExpr].
     pub fn alter(mut self, expr: AlterTableExpr) -> Result<TableContext> {
         match expr.alter_options {
@@ -127,6 +132,12 @@ impl TableContext {
                     }
                 );
                 self.name = new_table_name;
+                Ok(self)
+            }
+            AlterTableOperation::ModifyDataType { column } => {
+                if let Some(idx) = self.columns.iter().position(|col| col.name == column.name) {
+                    self.columns[idx].column_type = column.column_type;
+                }
                 Ok(self)
             }
         }

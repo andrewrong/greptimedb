@@ -30,6 +30,7 @@ pub enum PermissionReq<'a> {
     PromStoreWrite,
     PromStoreRead,
     Otlp,
+    LogWrite,
 }
 
 #[derive(Debug)]
@@ -41,7 +42,7 @@ pub enum PermissionResp {
 pub trait PermissionChecker: Send + Sync {
     fn check_permission(
         &self,
-        user_info: Option<UserInfoRef>,
+        user_info: UserInfoRef,
         req: PermissionReq,
     ) -> Result<PermissionResp>;
 }
@@ -49,7 +50,7 @@ pub trait PermissionChecker: Send + Sync {
 impl PermissionChecker for Option<&PermissionCheckerRef> {
     fn check_permission(
         &self,
-        user_info: Option<UserInfoRef>,
+        user_info: UserInfoRef,
         req: PermissionReq,
     ) -> Result<PermissionResp> {
         match self {

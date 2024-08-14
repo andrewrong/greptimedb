@@ -15,6 +15,7 @@
 pub mod builder;
 mod grpc;
 mod influxdb;
+mod log_handler;
 mod opentsdb;
 mod otlp;
 mod prom_store;
@@ -24,15 +25,13 @@ pub mod standalone;
 
 use std::sync::Arc;
 
-use api::v1::meta::Role;
 use async_trait::async_trait;
 use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
 use catalog::CatalogManagerRef;
 use client::OutputData;
 use common_base::Plugins;
 use common_config::KvBackendConfig;
-use common_error::ext::BoxedError;
-use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
+use common_error::ext::{BoxedError, ErrorExt};
 use common_meta::key::TableMetadataManagerRef;
 use common_meta::kv_backend::KvBackendRef;
 use common_meta::state_store::KvStateStore;
@@ -40,14 +39,12 @@ use common_procedure::local::{LocalManager, ManagerConfig};
 use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
 use common_query::Output;
-use common_telemetry::logging::info;
-use common_telemetry::{error, tracing};
+use common_telemetry::{debug, error, tracing};
 use log_store::raft_engine::RaftEngineBackend;
-use meta_client::client::{MetaClient, MetaClientBuilder};
-use meta_client::MetaClientOptions;
 use operator::delete::DeleterRef;
 use operator::insert::InserterRef;
 use operator::statement::StatementExecutor;
+use pipeline::pipeline_operator::PipelineOperator;
 use prometheus::HistogramTimer;
 use query::metrics::OnDone;
 use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
@@ -66,7 +63,7 @@ use servers::prometheus_handler::PrometheusHandler;
 use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{
-    InfluxdbLineProtocolHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
+    InfluxdbLineProtocolHandler, LogHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
     PromStoreProtocolHandler, ScriptHandler,
 };
 use servers::server::ServerHandlers;
@@ -86,7 +83,7 @@ use crate::error::{
     PermissionSnafu, PlanStatementSnafu, Result, SqlExecInterceptedSnafu, StartServerSnafu,
     TableOperationSnafu,
 };
-use crate::frontend::{FrontendOptions, TomlSerializable};
+use crate::frontend::FrontendOptions;
 use crate::heartbeat::HeartbeatTask;
 use crate::script::ScriptExecutor;
 
@@ -100,6 +97,7 @@ pub trait FrontendInstance:
     + OpenTelemetryProtocolHandler
     + ScriptHandler
     + PrometheusHandler
+    + LogHandler
     + Send
     + Sync
     + 'static
@@ -108,12 +106,13 @@ pub trait FrontendInstance:
 }
 
 pub type FrontendInstanceRef = Arc<dyn FrontendInstance>;
-pub type StatementExecutorRef = Arc<StatementExecutor>;
 
 #[derive(Clone)]
 pub struct Instance {
+    options: FrontendOptions,
     catalog_manager: CatalogManagerRef,
     script_executor: Arc<ScriptExecutor>,
+    pipeline_operator: Arc<PipelineOperator>,
     statement_executor: Arc<StatementExecutor>,
     query_engine: QueryEngineRef,
     plugins: Plugins,
@@ -126,40 +125,6 @@ pub struct Instance {
 }
 
 impl Instance {
-    pub async fn create_meta_client(
-        meta_client_options: &MetaClientOptions,
-    ) -> Result<Arc<MetaClient>> {
-        info!(
-            "Creating Frontend instance in distributed mode with Meta server addr {:?}",
-            meta_client_options.metasrv_addrs
-        );
-
-        let channel_config = ChannelConfig::new()
-            .timeout(meta_client_options.timeout)
-            .connect_timeout(meta_client_options.connect_timeout)
-            .tcp_nodelay(meta_client_options.tcp_nodelay);
-        let ddl_channel_config = channel_config
-            .clone()
-            .timeout(meta_client_options.ddl_timeout);
-        let channel_manager = ChannelManager::with_config(channel_config);
-        let ddl_channel_manager = ChannelManager::with_config(ddl_channel_config);
-
-        let cluster_id = 0; // TODO(jeremy): read from config
-        let mut meta_client = MetaClientBuilder::new(cluster_id, 0, Role::Frontend)
-            .enable_router()
-            .enable_store()
-            .enable_heartbeat()
-            .enable_procedure()
-            .channel_manager(channel_manager)
-            .ddl_channel_manager(ddl_channel_manager)
-            .build();
-        meta_client
-            .start(&meta_client_options.metasrv_addrs)
-            .await
-            .context(error::StartMetaClientSnafu)?;
-        Ok(Arc::new(meta_client))
-    }
-
     pub async fn try_build_standalone_components(
         dir: String,
         kv_backend_config: KvBackendConfig,
@@ -190,14 +155,9 @@ impl Instance {
         Ok((kv_backend, procedure_manager))
     }
 
-    pub fn build_servers(
-        &mut self,
-        opts: impl Into<FrontendOptions> + TomlSerializable,
-        servers: ServerHandlers,
-    ) -> Result<()> {
-        let opts: FrontendOptions = opts.into();
+    pub fn build_servers(&mut self, servers: ServerHandlers) -> Result<()> {
         self.export_metrics_task =
-            ExportMetricsTask::try_new(&opts.export_metrics, Some(&self.plugins))
+            ExportMetricsTask::try_new(&self.options.export_metrics, Some(&self.plugins))
                 .context(StartServerSnafu)?;
 
         self.servers = servers;
@@ -314,16 +274,18 @@ impl SqlQueryHandler for Instance {
                         break;
                     }
 
-                    match self.query_statement(stmt, query_ctx.clone()).await {
+                    match self.query_statement(stmt.clone(), query_ctx.clone()).await {
                         Ok(output) => {
                             let output_result =
                                 query_interceptor.post_execute(output, query_ctx.clone());
                             results.push(output_result);
                         }
                         Err(e) => {
-                            let redacted = sql::util::redact_sql_secrets(query.as_ref());
-                            error!(e; "Failed to execute query: {redacted}");
-
+                            if e.status_code().should_log_error() {
+                                error!(e; "Failed to execute query: {stmt}");
+                            } else {
+                                debug!("Failed to execute query: {stmt}, {e}");
+                            }
                             results.push(Err(e));
                             break;
                         }
@@ -443,9 +405,7 @@ impl PrometheusHandler for Instance {
             .execute_stmt(stmt, query_ctx.clone())
             .await
             .map_err(BoxedError::new)
-            .with_context(|_| ExecuteQuerySnafu {
-                query: format!("{query:?}"),
-            })?;
+            .context(ExecuteQuerySnafu)?;
 
         Ok(interceptor.post_execute(output, query_ctx)?)
     }
@@ -453,6 +413,17 @@ impl PrometheusHandler for Instance {
     fn catalog_manager(&self) -> CatalogManagerRef {
         self.catalog_manager.clone()
     }
+}
+
+/// Validate `stmt.database` permission if it's presented.
+macro_rules! validate_db_permission {
+    ($stmt: expr, $query_ctx: expr) => {
+        if let Some(database) = &$stmt.database {
+            validate_catalog_and_schema($query_ctx.current_catalog(), database, $query_ctx)
+                .map_err(BoxedError::new)
+                .context(SqlExecInterceptedSnafu)?;
+        }
+    };
 }
 
 pub fn check_permission(
@@ -473,13 +444,37 @@ pub fn check_permission(
         // These are executed by query engine, and will be checked there.
         Statement::Query(_) | Statement::Explain(_) | Statement::Tql(_) | Statement::Delete(_) => {}
         // database ops won't be checked
-        Statement::CreateDatabase(_) | Statement::ShowDatabases(_) | Statement::DropDatabase(_) => {
+        Statement::CreateDatabase(_)
+        | Statement::ShowDatabases(_)
+        | Statement::DropDatabase(_)
+        | Statement::DropFlow(_)
+        | Statement::Use(_) => {}
+        Statement::ShowCreateTable(stmt) => {
+            validate_param(&stmt.table_name, query_ctx)?;
         }
-        // show create table and alter are not supported yet
-        Statement::ShowCreateTable(_) | Statement::CreateExternalTable(_) | Statement::Alter(_) => {
+        Statement::ShowCreateFlow(stmt) => {
+            validate_param(&stmt.flow_name, query_ctx)?;
+        }
+        Statement::ShowCreateView(stmt) => {
+            validate_param(&stmt.view_name, query_ctx)?;
+        }
+        Statement::CreateExternalTable(stmt) => {
+            validate_param(&stmt.name, query_ctx)?;
+        }
+        Statement::CreateFlow(stmt) => {
+            // TODO: should also validate source table name here?
+            validate_param(&stmt.sink_table_name, query_ctx)?;
+        }
+        Statement::CreateView(stmt) => {
+            validate_param(&stmt.name, query_ctx)?;
+        }
+        Statement::Alter(stmt) => {
+            validate_param(stmt.table_name(), query_ctx)?;
         }
         // set/show variable now only alter/show variable in session
         Statement::SetVariables(_) | Statement::ShowVariables(_) => {}
+        // show charset and show collation won't be checked
+        Statement::ShowCharset(_) | Statement::ShowCollation(_) => {}
 
         Statement::Insert(insert) => {
             validate_param(insert.table_name(), query_ctx)?;
@@ -492,15 +487,32 @@ pub fn check_permission(
             validate_param(&stmt.source_name, query_ctx)?;
         }
         Statement::DropTable(drop_stmt) => {
-            validate_param(drop_stmt.table_name(), query_ctx)?;
-        }
-        Statement::ShowTables(stmt) => {
-            if let Some(database) = &stmt.database {
-                validate_catalog_and_schema(query_ctx.current_catalog(), database, query_ctx)
-                    .map_err(BoxedError::new)
-                    .context(SqlExecInterceptedSnafu)?;
+            for table_name in drop_stmt.table_names() {
+                validate_param(table_name, query_ctx)?;
             }
         }
+        Statement::DropView(stmt) => {
+            validate_param(&stmt.view_name, query_ctx)?;
+        }
+        Statement::ShowTables(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowTableStatus(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowColumns(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowIndex(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowViews(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowFlows(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowStatus(_stmt) => {}
         Statement::DescribeTable(stmt) => {
             validate_param(stmt.name(), query_ctx)?;
         }
@@ -623,7 +635,7 @@ mod tests {
                             ts TIMESTAMP,
                             TIME INDEX (ts),
                             PRIMARY KEY(host)
-                        ) engine=mito with(regions=1);"#;
+                        ) engine=mito;"#;
         replace_test(sql, plugins.clone(), &query_ctx);
 
         // test drop table

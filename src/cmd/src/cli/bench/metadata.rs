@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use common_meta::key::table_route::TableRouteValue;
 use common_meta::key::TableMetadataManagerRef;
-use common_meta::table_name::TableName;
+use table::table_name::TableName;
 
 use crate::cli::bench::{
     bench_self_recorded, create_region_routes, create_region_wal_options, create_table_info,
@@ -106,9 +106,12 @@ impl TableMetadataBencher {
                     .await
                     .unwrap();
                 let start = Instant::now();
+                let table_info = table_info.unwrap();
+                let table_route = table_route.unwrap();
+                let table_id = table_info.table_info.ident.table_id;
                 let _ = self
                     .table_metadata_manager
-                    .delete_table_metadata(&table_info.unwrap(), &table_route.unwrap())
+                    .delete_table_metadata(table_id, &table_info.table_name(), &table_route)
                     .await;
                 start.elapsed()
             },
@@ -134,7 +137,7 @@ impl TableMetadataBencher {
                 let start = Instant::now();
                 let _ = self
                     .table_metadata_manager
-                    .rename_table(table_info.unwrap(), new_table_name)
+                    .rename_table(&table_info.unwrap(), new_table_name)
                     .await;
 
                 start.elapsed()

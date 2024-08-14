@@ -115,6 +115,7 @@ impl Env {
                 server_processes: Some(Arc::new(Mutex::new(vec![server_process]))),
                 metasrv_process: None,
                 frontend_process: None,
+                flownode_process: None,
                 client: TokioMutex::new(db),
                 ctx: db_ctx,
                 is_standalone: true,
@@ -141,6 +142,8 @@ impl Env {
 
             let frontend = self.start_server("frontend", &db_ctx, true).await;
 
+            let flownode = self.start_server("flownode", &db_ctx, true).await;
+
             let client = Client::with_urls(vec![SERVER_ADDR]);
             let db = DB::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, client);
 
@@ -150,6 +153,7 @@ impl Env {
                 ]))),
                 metasrv_process: Some(meta_server),
                 frontend_process: Some(frontend),
+                flownode_process: Some(flownode),
                 client: TokioMutex::new(db),
                 ctx: db_ctx,
                 is_standalone: false,
@@ -166,6 +170,7 @@ impl Env {
             server_processes: None,
             metasrv_process: None,
             frontend_process: None,
+            flownode_process: None,
             ctx: GreptimeDBContext {
                 time: 0,
                 datanode_id: Default::default(),
@@ -192,12 +197,16 @@ impl Env {
                 db_ctx.incr_datanode_id();
                 format!("greptime-sqlness-datanode-{}.log", db_ctx.datanode_id())
             }
+            // The flownode id is always 0 for now
+            "flownode" => "greptime-sqlness-flownode.log".to_string(),
             "frontend" => "greptime-sqlness-frontend.log".to_string(),
             "metasrv" => "greptime-sqlness-metasrv.log".to_string(),
             "standalone" => "greptime-sqlness-standalone.log".to_string(),
             _ => panic!("Unexpected subcommand: {subcommand}"),
         };
         let log_file_name = self.data_home.join(log_file_name).display().to_string();
+
+        println!("{subcommand} log file at {log_file_name}");
 
         let log_file = OpenOptions::new()
             .create(true)
@@ -209,6 +218,7 @@ impl Env {
 
         let (args, check_ip_addr) = match subcommand {
             "datanode" => self.datanode_start_args(db_ctx),
+            "flownode" => self.flownode_start_args(db_ctx),
             "standalone" => {
                 let args = vec![
                     DEFAULT_LOG_LEVEL.to_string(),
@@ -225,7 +235,7 @@ impl Env {
                     DEFAULT_LOG_LEVEL.to_string(),
                     subcommand.to_string(),
                     "start".to_string(),
-                    "--metasrv-addr=127.0.0.1:3002".to_string(),
+                    "--metasrv-addrs=127.0.0.1:3002".to_string(),
                     "--http-addr=127.0.0.1:5003".to_string(),
                 ];
                 (args, SERVER_ADDR.to_string())
@@ -301,8 +311,23 @@ impl Env {
         args.push(format!("--node-id={id}"));
         args.push("-c".to_string());
         args.push(self.generate_config_file(subcommand, db_ctx));
-        args.push("--metasrv-addr=127.0.0.1:3002".to_string());
+        args.push("--metasrv-addrs=127.0.0.1:3002".to_string());
         (args, format!("127.0.0.1:410{id}"))
+    }
+
+    fn flownode_start_args(&self, _db_ctx: &GreptimeDBContext) -> (Vec<String>, String) {
+        let id = 0;
+
+        let subcommand = "flownode";
+        let mut args = vec![
+            DEFAULT_LOG_LEVEL.to_string(),
+            subcommand.to_string(),
+            "start".to_string(),
+        ];
+        args.push(format!("--rpc-addr=127.0.0.1:680{id}"));
+        args.push(format!("--node-id={id}"));
+        args.push("--metasrv-addrs=127.0.0.1:3002".to_string());
+        (args, format!("127.0.0.1:680{id}"))
     }
 
     /// stop and restart the server process
@@ -419,6 +444,7 @@ pub struct GreptimeDB {
     server_processes: Option<Arc<Mutex<Vec<Child>>>>,
     metasrv_process: Option<Child>,
     frontend_process: Option<Child>,
+    flownode_process: Option<Child>,
     client: TokioMutex<DB>,
     ctx: GreptimeDBContext,
     is_standalone: bool,
@@ -434,7 +460,9 @@ impl Database for GreptimeDB {
 
         let mut client = self.client.lock().await;
 
-        if query.trim().to_lowercase().starts_with("use ") {
+        let query_str = query.trim().to_lowercase();
+
+        if query_str.starts_with("use ") {
             // use [db]
             let database = query
                 .split_ascii_whitespace()
@@ -445,7 +473,10 @@ impl Database for GreptimeDB {
             Box::new(ResultDisplayer {
                 result: Ok(Output::new_with_affected_rows(0)),
             }) as _
-        } else if query.trim().to_lowercase().starts_with("set time_zone") {
+        } else if query_str.starts_with("set time_zone")
+            || query_str.starts_with("set session time_zone")
+            || query_str.starts_with("set local time_zone")
+        {
             // set time_zone='xxx'
             let timezone = query
                 .split('=')
@@ -508,6 +539,10 @@ impl GreptimeDB {
         if let Some(mut frontend) = self.frontend_process.take() {
             Env::stop_server(&mut frontend);
             println!("Frontend (pid = {}) is stopped", frontend.id());
+        }
+        if let Some(mut flownode) = self.flownode_process.take() {
+            Env::stop_server(&mut flownode);
+            println!("Flownode (pid = {}) is stopped", flownode.id());
         }
         if matches!(self.ctx.wal, WalConfig::Kafka { needs_kafka_cluster, .. } if needs_kafka_cluster)
         {

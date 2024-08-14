@@ -10,15 +10,18 @@ name = "greptime"
 path = "src/bin/greptime.rs"
 
 [features]
+default = ["python"]
 tokio-console = ["common-telemetry/tokio-console"]
+python = ["frontend/python"]
 
 [lints]
 workspace = true
 
 [dependencies]
-anymap = "1.0.0-beta.2"
 async-trait.workspace = true
 auth.workspace = true
+base64.workspace = true
+cache.workspace = true
 catalog.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -27,6 +30,7 @@ common-base.workspace = true
 common-catalog.workspace = true
 common-config.workspace = true
 common-error.workspace = true
+common-grpc.workspace = true
 common-macro.workspace = true
 common-meta.workspace = true
 common-procedure.workspace = true
@@ -37,28 +41,30 @@ common-telemetry = { workspace = true, features = [
     "deadlock_detection",
 ] }
 common-time.workspace = true
+common-version.workspace = true
 common-wal.workspace = true
-config = "0.13"
 datanode.workspace = true
 datatypes.workspace = true
 either = "1.8"
 etcd-client.workspace = true
 file-engine.workspace = true
-frontend.workspace = true
+flow.workspace = true
+frontend = { workspace = true, default-features = false }
 futures.workspace = true
 human-panic = "1.2.2"
 lazy_static.workspace = true
 meta-client.workspace = true
 meta-srv.workspace = true
 mito2.workspace = true
+moka.workspace = true
 nu-ansi-term = "0.46"
-partition.workspace = true
 plugins.workspace = true
 prometheus.workspace = true
 prost.workspace = true
 query.workspace = true
 rand.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 rustyline = "10.1"
 serde.workspace = true
 serde_json.workspace = true
@@ -70,17 +76,19 @@ substrait.workspace = true
 table.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tonic.workspace = true
+tracing-appender = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = "0.5"
 
 [dev-dependencies]
+client = { workspace = true, features = ["testing"] }
 common-test-util.workspace = true
+common-version.workspace = true
 serde.workspace = true
 temp-env = "0.3"
+tempfile.workspace = true
 
 [target.'cfg(not(windows))'.dev-dependencies]
 rexpect = "0.5"
-
-[build-dependencies]
-common-version.workspace = true

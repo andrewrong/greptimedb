@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::assert_matches::assert_matches;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -22,9 +21,10 @@ use common_meta::heartbeat::handler::{
     HandlerGroupExecutor, HeartbeatResponseHandlerContext, HeartbeatResponseHandlerExecutor,
 };
 use common_meta::heartbeat::mailbox::{HeartbeatMailbox, MessageMeta};
-use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
+use common_meta::instruction::{CacheIdent, Instruction};
+use common_meta::key::schema_name::{SchemaName, SchemaNameKey};
 use common_meta::key::table_info::TableInfoKey;
-use common_meta::key::TableMetaKey;
+use common_meta::key::MetaKey;
 use partition::manager::TableRouteCacheInvalidator;
 use table::metadata::TableId;
 use tokio::sync::mpsc;
@@ -54,51 +54,6 @@ impl TableRouteCacheInvalidator for MockTableRouteCacheInvalidator {
     }
 }
 
-#[tokio::test]
-async fn test_invalidate_table_cache_handler() {
-    let table_id = 1;
-    let table_info_key = TableInfoKey::new(table_id);
-    let inner = HashMap::from([(table_info_key.as_raw_key(), 1)]);
-    let backend = Arc::new(MockKvCacheInvalidator {
-        inner: Mutex::new(inner),
-    });
-
-    let executor = Arc::new(HandlerGroupExecutor::new(vec![Arc::new(
-        InvalidateTableCacheHandler::new(backend.clone()),
-    )]));
-
-    let (tx, mut rx) = mpsc::channel(8);
-    let mailbox = Arc::new(HeartbeatMailbox::new(tx));
-
-    // removes a valid key
-    handle_instruction(
-        executor.clone(),
-        mailbox.clone(),
-        Instruction::InvalidateTableIdCache(table_id),
-    )
-    .await;
-
-    let (_, reply) = rx.recv().await.unwrap();
-    assert_matches!(
-        reply,
-        InstructionReply::InvalidateTableCache(SimpleReply { result: true, .. })
-    );
-    assert!(!backend
-        .inner
-        .lock()
-        .unwrap()
-        .contains_key(&table_info_key.as_raw_key()));
-
-    // removes a invalid key
-    handle_instruction(executor, mailbox, Instruction::InvalidateTableIdCache(0)).await;
-
-    let (_, reply) = rx.recv().await.unwrap();
-    assert_matches!(
-        reply,
-        InstructionReply::InvalidateTableCache(SimpleReply { result: true, .. })
-    );
-}
-
 pub fn test_message_meta(id: u64, subject: &str, to: &str, from: &str) -> MessageMeta {
     MessageMeta {
         id,
@@ -118,4 +73,86 @@ async fn handle_instruction(
         HeartbeatResponseHandlerContext::new(mailbox, response);
     ctx.incoming_message = Some((test_message_meta(1, "hi", "foo", "bar"), instruction));
     executor.handle(ctx).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_invalidate_table_cache_handler() {
+    let table_id = 1;
+    let table_info_key = TableInfoKey::new(table_id);
+    let inner = HashMap::from([(table_info_key.to_bytes(), 1)]);
+    let backend = Arc::new(MockKvCacheInvalidator {
+        inner: Mutex::new(inner),
+    });
+
+    let executor = Arc::new(HandlerGroupExecutor::new(vec![Arc::new(
+        InvalidateTableCacheHandler::new(backend.clone()),
+    )]));
+
+    let (tx, _) = mpsc::channel(8);
+    let mailbox = Arc::new(HeartbeatMailbox::new(tx));
+
+    // removes a valid key
+    handle_instruction(
+        executor.clone(),
+        mailbox.clone(),
+        Instruction::InvalidateCaches(vec![CacheIdent::TableId(table_id)]),
+    )
+    .await;
+
+    assert!(!backend
+        .inner
+        .lock()
+        .unwrap()
+        .contains_key(&table_info_key.to_bytes()));
+
+    // removes a invalid key
+    handle_instruction(
+        executor,
+        mailbox,
+        Instruction::InvalidateCaches(vec![CacheIdent::TableId(0)]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_invalidate_schema_key_handler() {
+    let (catalog, schema) = ("foo", "bar");
+    let schema_key = SchemaNameKey { catalog, schema };
+    let inner = HashMap::from([(schema_key.to_bytes(), 1)]);
+    let backend = Arc::new(MockKvCacheInvalidator {
+        inner: Mutex::new(inner),
+    });
+
+    let executor = Arc::new(HandlerGroupExecutor::new(vec![Arc::new(
+        InvalidateTableCacheHandler::new(backend.clone()),
+    )]));
+
+    let (tx, _) = mpsc::channel(8);
+    let mailbox = Arc::new(HeartbeatMailbox::new(tx));
+
+    // removes a valid key
+    let valid_key = SchemaName {
+        catalog_name: catalog.to_string(),
+        schema_name: schema.to_string(),
+    };
+    handle_instruction(
+        executor.clone(),
+        mailbox.clone(),
+        Instruction::InvalidateCaches(vec![CacheIdent::SchemaName(valid_key.clone())]),
+    )
+    .await;
+
+    assert!(!backend
+        .inner
+        .lock()
+        .unwrap()
+        .contains_key(&schema_key.to_bytes()));
+
+    // removes a invalid key
+    handle_instruction(
+        executor,
+        mailbox,
+        Instruction::InvalidateCaches(vec![CacheIdent::SchemaName(valid_key)]),
+    )
+    .await;
 }

@@ -33,28 +33,46 @@ pub enum Error {
     },
 
     #[snafu(display("Invalid date string, raw: {}", raw))]
-    InvalidDateStr { raw: String, location: Location },
+    InvalidDateStr {
+        raw: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to parse a string into Timestamp, raw string: {}", raw))]
-    ParseTimestamp { raw: String, location: Location },
+    ParseTimestamp {
+        raw: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to parse a string into Interval, raw string: {}", raw))]
-    ParseInterval { raw: String, location: Location },
+    ParseInterval {
+        raw: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Current timestamp overflow"))]
     TimestampOverflow {
         #[snafu(source)]
         error: TryFromIntError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Timestamp arithmetic overflow, msg: {}", msg))]
-    ArithmeticOverflow { msg: String, location: Location },
+    ArithmeticOverflow {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid timezone offset: {hours}:{minutes}"))]
     InvalidTimezoneOffset {
         hours: i32,
         minutes: u32,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -63,17 +81,23 @@ pub enum Error {
         raw: String,
         #[snafu(source)]
         error: ParseIntError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid timezone string {raw}"))]
-    ParseTimezoneName { raw: String, location: Location },
+    ParseTimezoneName {
+        raw: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to format, pattern: {}", pattern))]
     Format {
         pattern: String,
         #[snafu(source)]
         error: std::fmt::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 }
@@ -97,21 +121,6 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn location_opt(&self) -> Option<common_error::snafu::Location> {
-        match self {
-            Error::ParseTimestamp { location, .. }
-            | Error::Format { location, .. }
-            | Error::TimestampOverflow { location, .. }
-            | Error::ArithmeticOverflow { location, .. } => Some(*location),
-            Error::ParseDateStr { .. }
-            | Error::InvalidTimezoneOffset { .. }
-            | Error::ParseOffsetStr { .. }
-            | Error::ParseTimezoneName { .. } => None,
-            Error::InvalidDateStr { location, .. } => Some(*location),
-            Error::ParseInterval { location, .. } => Some(*location),
-        }
     }
 }
 

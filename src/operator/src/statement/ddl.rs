@@ -12,54 +12,69 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::helper::ColumnDataTypeWrapper;
-use api::v1::{column_def, AlterExpr, CreateTableExpr};
+use api::v1::meta::CreateFlowTask as PbCreateFlowTask;
+use api::v1::{column_def, AlterExpr, CreateFlowExpr, CreateTableExpr, CreateViewExpr};
 use catalog::CatalogManagerRef;
 use chrono::Utc;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_catalog::format_full_table_name;
+use common_catalog::consts::{is_readonly_schema, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_catalog::{format_full_flow_name, format_full_table_name};
 use common_error::ext::BoxedError;
 use common_meta::cache_invalidator::Context;
 use common_meta::ddl::ExecutorContext;
+use common_meta::instruction::CacheIdent;
 use common_meta::key::schema_name::{SchemaNameKey, SchemaNameValue};
 use common_meta::key::NAME_PATTERN;
-use common_meta::rpc::ddl::{DdlTask, SubmitDdlTaskRequest, SubmitDdlTaskResponse};
+use common_meta::rpc::ddl::{
+    CreateFlowTask, DdlTask, DropFlowTask, DropViewTask, SubmitDdlTaskRequest,
+    SubmitDdlTaskResponse,
+};
 use common_meta::rpc::router::{Partition, Partition as MetaPartition};
-use common_meta::table_name::TableName;
 use common_query::Output;
-use common_telemetry::{info, tracing};
+use common_telemetry::{debug, info, tracing};
 use common_time::Timezone;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::RawSchema;
 use datatypes::value::Value;
 use lazy_static::lazy_static;
 use partition::expr::{Operand, PartitionExpr, RestrictedOp};
+use partition::multi_dim::MultiDimPartitionRule;
 use partition::partition::{PartitionBound, PartitionDef};
+use query::parser::QueryStatement;
+use query::plan::extract_and_rewrite_full_table_names;
+use query::query_engine::DefaultSerializer;
 use query::sql::create_table_stmt;
 use regex::Regex;
 use session::context::QueryContextRef;
 use session::table_name::table_idents_to_full_name;
-use snafu::{ensure, IntoError, OptionExt, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 use sql::statements::alter::AlterTable;
-use sql::statements::create::{CreateExternalTable, CreateTable, CreateTableLike, Partitions};
+use sql::statements::create::{
+    CreateExternalTable, CreateFlow, CreateTable, CreateTableLike, CreateView, Partitions,
+};
 use sql::statements::sql_value_to_value;
-use sqlparser::ast::{Expr, Ident, Value as ParserValue};
+use sql::statements::statement::Statement;
+use sqlparser::ast::{Expr, Ident, UnaryOperator, Value as ParserValue};
+use store_api::metric_engine_consts::{LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME};
+use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use table::dist_table::DistTable;
 use table::metadata::{self, RawTableInfo, RawTableMeta, TableId, TableInfo, TableType};
-use table::requests::{AlterKind, AlterTableRequest, TableOptions};
+use table::requests::{AlterKind, AlterTableRequest, TableOptions, COMMENT_KEY};
+use table::table_name::TableName;
 use table::TableRef;
 
 use super::StatementExecutor;
 use crate::error::{
     self, AlterExprToRequestSnafu, CatalogSnafu, ColumnDataTypeSnafu, ColumnNotFoundSnafu,
-    CreateLogicalTablesSnafu, CreateTableInfoSnafu, CreateTableWithMultiCatalogsSnafu,
-    CreateTableWithMultiSchemasSnafu, DeserializePartitionSnafu, EmptyCreateTableExprSnafu,
-    InvalidPartitionColumnsSnafu, InvalidPartitionRuleSnafu, InvalidTableNameSnafu,
-    ParseSqlValueSnafu, Result, SchemaNotFoundSnafu, TableAlreadyExistsSnafu,
-    TableMetadataManagerSnafu, TableNotFoundSnafu, UnrecognizedTableOptionSnafu,
+    CreateLogicalTablesSnafu, CreateTableInfoSnafu, DeserializePartitionSnafu, EmptyDdlExprSnafu,
+    ExtractTableNamesSnafu, FlowNotFoundSnafu, InvalidPartitionColumnsSnafu,
+    InvalidPartitionRuleSnafu, InvalidPartitionSnafu, InvalidTableNameSnafu, InvalidViewNameSnafu,
+    InvalidViewStmtSnafu, ParseSqlValueSnafu, Result, SchemaInUseSnafu, SchemaNotFoundSnafu,
+    SchemaReadOnlySnafu, SubstraitCodecSnafu, TableAlreadyExistsSnafu, TableMetadataManagerSnafu,
+    TableNotFoundSnafu, UnrecognizedTableOptionSnafu, ViewAlreadyExistsSnafu,
 };
 use crate::expr_factory;
 use crate::statement::show::create_partitions_stmt;
@@ -75,8 +90,8 @@ impl StatementExecutor {
 
     #[tracing::instrument(skip_all)]
     pub async fn create_table(&self, stmt: CreateTable, ctx: QueryContextRef) -> Result<TableRef> {
-        let create_expr = &mut expr_factory::create_to_expr(&stmt, ctx.clone())?;
-        self.create_table_inner(create_expr, stmt.partitions, &ctx)
+        let create_expr = &mut expr_factory::create_to_expr(&stmt, &ctx)?;
+        self.create_table_inner(create_expr, stmt.partitions, ctx)
             .await
     }
 
@@ -116,8 +131,8 @@ impl StatementExecutor {
             }
         });
 
-        let create_expr = &mut expr_factory::create_to_expr(&create_stmt, ctx.clone())?;
-        self.create_table_inner(create_expr, partitions, &ctx).await
+        let create_expr = &mut expr_factory::create_to_expr(&create_stmt, &ctx)?;
+        self.create_table_inner(create_expr, partitions, ctx).await
     }
 
     #[tracing::instrument(skip_all)]
@@ -126,8 +141,8 @@ impl StatementExecutor {
         create_expr: CreateExternalTable,
         ctx: QueryContextRef,
     ) -> Result<TableRef> {
-        let create_expr = &mut expr_factory::create_external_expr(create_expr, ctx.clone()).await?;
-        self.create_table_inner(create_expr, None, &ctx).await
+        let create_expr = &mut expr_factory::create_external_expr(create_expr, &ctx).await?;
+        self.create_table_inner(create_expr, None, ctx).await
     }
 
     #[tracing::instrument(skip_all)]
@@ -135,8 +150,38 @@ impl StatementExecutor {
         &self,
         create_table: &mut CreateTableExpr,
         partitions: Option<Partitions>,
-        query_ctx: &QueryContextRef,
+        query_ctx: QueryContextRef,
     ) -> Result<TableRef> {
+        ensure!(
+            !is_readonly_schema(&create_table.schema_name),
+            SchemaReadOnlySnafu {
+                name: create_table.schema_name.clone()
+            }
+        );
+
+        // Check if is creating logical table
+        if create_table.engine == METRIC_ENGINE_NAME
+            && create_table
+                .table_options
+                .contains_key(LOGICAL_TABLE_METADATA_KEY)
+        {
+            let catalog_name = &create_table.catalog_name;
+            let schema_name = &create_table.schema_name;
+            return self
+                .create_logical_tables(
+                    catalog_name,
+                    schema_name,
+                    &[create_table.clone()],
+                    query_ctx,
+                )
+                .await?
+                .into_iter()
+                .next()
+                .context(error::UnexpectedSnafu {
+                    violated: "expected to create a logical table",
+                });
+        }
+
         let _timer = crate::metrics::DIST_CREATE_TABLE.start_timer();
         let schema = self
             .table_metadata_manager
@@ -193,19 +238,26 @@ impl StatementExecutor {
             &create_table.table_name,
         );
 
-        let (partitions, partition_cols) = parse_partitions(create_table, partitions, query_ctx)?;
-
+        let (partitions, partition_cols) = parse_partitions(create_table, partitions, &query_ctx)?;
         validate_partition_columns(create_table, &partition_cols)?;
-
         let mut table_info = create_table_info(create_table, partition_cols, schema_opts)?;
 
         let resp = self
-            .create_table_procedure(create_table.clone(), partitions, table_info.clone())
+            .create_table_procedure(
+                create_table.clone(),
+                partitions,
+                table_info.clone(),
+                query_ctx,
+            )
             .await?;
 
-        let table_id = resp.table_id.context(error::UnexpectedSnafu {
-            violated: "expected table_id",
-        })?;
+        let table_id = resp
+            .table_ids
+            .into_iter()
+            .next()
+            .context(error::UnexpectedSnafu {
+                violated: "expected table_id",
+            })?;
         info!("Successfully created table '{table_name}' with table id {table_id}");
 
         table_info.ident.table_id = table_id;
@@ -221,50 +273,25 @@ impl StatementExecutor {
     #[tracing::instrument(skip_all)]
     pub async fn create_logical_tables(
         &self,
+        catalog_name: &str,
+        schema_name: &str,
         create_table_exprs: &[CreateTableExpr],
+        query_context: QueryContextRef,
     ) -> Result<Vec<TableRef>> {
         let _timer = crate::metrics::DIST_CREATE_TABLES.start_timer();
-        ensure!(!create_table_exprs.is_empty(), EmptyCreateTableExprSnafu);
         ensure!(
-            create_table_exprs
-                .windows(2)
-                .all(|expr| expr[0].catalog_name == expr[1].catalog_name),
-            CreateTableWithMultiCatalogsSnafu {
-                catalog_names: create_table_exprs
-                    .iter()
-                    .map(|x| x.catalog_name.as_str())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    .to_string()
+            !create_table_exprs.is_empty(),
+            EmptyDdlExprSnafu {
+                name: "create logic tables"
             }
         );
-        let catalog_name = create_table_exprs[0].catalog_name.to_string();
-
-        ensure!(
-            create_table_exprs
-                .windows(2)
-                .all(|expr| expr[0].schema_name == expr[1].schema_name),
-            CreateTableWithMultiSchemasSnafu {
-                schema_names: create_table_exprs
-                    .iter()
-                    .map(|x| x.schema_name.as_str())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    .to_string()
-            }
-        );
-        let schema_name = create_table_exprs[0].schema_name.to_string();
 
         // Check table names
         for create_table in create_table_exprs {
             ensure!(
                 NAME_PATTERN_REG.is_match(&create_table.table_name),
                 InvalidTableNameSnafu {
-                    table_name: create_table.table_name.clone(),
+                    table_name: &create_table.table_name,
                 }
             );
         }
@@ -272,11 +299,11 @@ impl StatementExecutor {
         let schema = self
             .table_metadata_manager
             .schema_manager()
-            .get(SchemaNameKey::new(&catalog_name, &schema_name))
+            .get(SchemaNameKey::new(catalog_name, schema_name))
             .await
             .context(TableMetadataManagerSnafu)?
             .context(SchemaNotFoundSnafu {
-                schema_info: &schema_name,
+                schema_info: schema_name,
             })?;
 
         let mut raw_tables_info = create_table_exprs
@@ -289,7 +316,9 @@ impl StatementExecutor {
             .zip(raw_tables_info.iter().cloned())
             .collect::<Vec<_>>();
 
-        let resp = self.create_logical_tables_procedure(tables_data).await?;
+        let resp = self
+            .create_logical_tables_procedure(tables_data, query_context)
+            .await?;
 
         let table_ids = resp.table_ids;
         ensure!(table_ids.len() == raw_tables_info.len(), CreateLogicalTablesSnafu {
@@ -312,46 +341,518 @@ impl StatementExecutor {
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn drop_table(&self, table_name: TableName, drop_if_exists: bool) -> Result<Output> {
+    pub async fn create_flow(
+        &self,
+        stmt: CreateFlow,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        // TODO(ruihang): do some verification
+        let expr = expr_factory::to_create_flow_task_expr(stmt, &query_context)?;
+
+        self.create_flow_inner(expr, query_context).await
+    }
+
+    pub async fn create_flow_inner(
+        &self,
+        expr: CreateFlowExpr,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        self.create_flow_procedure(expr, query_context).await?;
+        Ok(Output::new_with_affected_rows(0))
+    }
+
+    async fn create_flow_procedure(
+        &self,
+        expr: CreateFlowExpr,
+        query_context: QueryContextRef,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let task = CreateFlowTask::try_from(PbCreateFlowTask {
+            create_flow: Some(expr),
+        })
+        .context(error::InvalidExprSnafu)?;
+        let request = SubmitDdlTaskRequest {
+            query_context,
+            task: DdlTask::new_create_flow(task),
+        };
+
+        self.procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
+            .await
+            .context(error::ExecuteDdlSnafu)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn create_view(
+        &self,
+        create_view: CreateView,
+        ctx: QueryContextRef,
+    ) -> Result<TableRef> {
+        // convert input into logical plan
+        let logical_plan = match &*create_view.query {
+            Statement::Query(query) => {
+                self.plan(
+                    QueryStatement::Sql(Statement::Query(query.clone())),
+                    ctx.clone(),
+                )
+                .await?
+            }
+            Statement::Tql(query) => self.plan_tql(query.clone(), &ctx).await?,
+            _ => {
+                return InvalidViewStmtSnafu {}.fail();
+            }
+        };
+        // Save the definition for `show create view`.
+        let definition = create_view.to_string();
+
+        // Save the columns in plan, it may changed when the schemas of tables in plan
+        // are altered.
+        let plan_columns: Vec<_> = logical_plan
+            .schema()
+            .context(error::GetSchemaSnafu)?
+            .column_schemas()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        let columns: Vec<_> = create_view
+            .columns
+            .iter()
+            .map(|ident| ident.to_string())
+            .collect();
+
+        // Validate columns
+        if !columns.is_empty() {
+            ensure!(
+                columns.len() == plan_columns.len(),
+                error::ViewColumnsMismatchSnafu {
+                    view_name: create_view.name.to_string(),
+                    expected: plan_columns.len(),
+                    actual: columns.len(),
+                }
+            );
+        }
+
+        // Extract the table names from the original plan
+        // and rewrite them as fully qualified names.
+        let (table_names, plan) =
+            extract_and_rewrite_full_table_names(logical_plan.unwrap_df_plan(), ctx.clone())
+                .context(ExtractTableNamesSnafu)?;
+
+        let table_names = table_names.into_iter().map(|t| t.into()).collect();
+
+        // TODO(dennis): we don't save the optimized plan yet,
+        // because there are some serialization issue with our own defined plan node (such as `MergeScanLogicalPlan`).
+        // When the issues are fixed, we can use the `optimized_plan` instead.
+        // let optimized_plan = self.optimize_logical_plan(logical_plan)?.unwrap_df_plan();
+
+        // encode logical plan
+        let encoded_plan = DFLogicalSubstraitConvertor
+            .encode(&plan, DefaultSerializer)
+            .context(SubstraitCodecSnafu)?;
+
+        let expr = expr_factory::to_create_view_expr(
+            create_view,
+            encoded_plan.to_vec(),
+            table_names,
+            columns,
+            plan_columns,
+            definition,
+            ctx.clone(),
+        )?;
+
+        //TODO(dennis): validate the logical plan
+        self.create_view_by_expr(expr, ctx).await
+    }
+
+    pub async fn create_view_by_expr(
+        &self,
+        expr: CreateViewExpr,
+        ctx: QueryContextRef,
+    ) -> Result<TableRef> {
+        let _timer = crate::metrics::DIST_CREATE_VIEW.start_timer();
+
+        let schema_exists = self
+            .table_metadata_manager
+            .schema_manager()
+            .exists(SchemaNameKey::new(&expr.catalog_name, &expr.schema_name))
+            .await
+            .context(TableMetadataManagerSnafu)?;
+
+        ensure!(
+            schema_exists,
+            SchemaNotFoundSnafu {
+                schema_info: &expr.schema_name,
+            }
+        );
+
+        // if view or table exists.
         if let Some(table) = self
             .catalog_manager
-            .table(
-                &table_name.catalog_name,
-                &table_name.schema_name,
-                &table_name.table_name,
-            )
+            .table(&expr.catalog_name, &expr.schema_name, &expr.view_name)
             .await
             .context(CatalogSnafu)?
         {
-            let table_id = table.table_info().table_id();
-            self.drop_table_procedure(&table_name, table_id, drop_if_exists)
+            let table_type = table.table_info().table_type;
+
+            match (table_type, expr.create_if_not_exists, expr.or_replace) {
+                (TableType::View, true, false) => {
+                    return Ok(table);
+                }
+                (TableType::View, false, false) => {
+                    return ViewAlreadyExistsSnafu {
+                        name: format_full_table_name(
+                            &expr.catalog_name,
+                            &expr.schema_name,
+                            &expr.view_name,
+                        ),
+                    }
+                    .fail();
+                }
+                (TableType::View, _, true) => {
+                    // Try to replace an exists view
+                }
+                _ => {
+                    return TableAlreadyExistsSnafu {
+                        table: format_full_table_name(
+                            &expr.catalog_name,
+                            &expr.schema_name,
+                            &expr.view_name,
+                        ),
+                    }
+                    .fail();
+                }
+            }
+        }
+
+        ensure!(
+            NAME_PATTERN_REG.is_match(&expr.view_name),
+            InvalidViewNameSnafu {
+                name: expr.view_name.clone(),
+            }
+        );
+
+        let view_name = TableName::new(&expr.catalog_name, &expr.schema_name, &expr.view_name);
+
+        let mut view_info = RawTableInfo {
+            ident: metadata::TableIdent {
+                // The view id of distributed table is assigned by Meta, set "0" here as a placeholder.
+                table_id: 0,
+                version: 0,
+            },
+            name: expr.view_name.clone(),
+            desc: None,
+            catalog_name: expr.catalog_name.clone(),
+            schema_name: expr.schema_name.clone(),
+            // The meta doesn't make sense for views, so using a default one.
+            meta: RawTableMeta::default(),
+            table_type: TableType::View,
+        };
+
+        let request = SubmitDdlTaskRequest {
+            query_context: ctx,
+            task: DdlTask::new_create_view(expr, view_info.clone()),
+        };
+
+        let resp = self
+            .procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
+            .await
+            .context(error::ExecuteDdlSnafu)?;
+
+        debug!(
+            "Submit creating view '{view_name}' task response: {:?}",
+            resp
+        );
+
+        let view_id = resp
+            .table_ids
+            .into_iter()
+            .next()
+            .context(error::UnexpectedSnafu {
+                violated: "expected table_id",
+            })?;
+        info!("Successfully created view '{view_name}' with view id {view_id}");
+
+        view_info.ident.table_id = view_id;
+
+        let view_info = Arc::new(view_info.try_into().context(CreateTableInfoSnafu)?);
+
+        let table = DistTable::table(view_info);
+
+        // Invalidates local cache ASAP.
+        self.cache_invalidator
+            .invalidate(
+                &Context::default(),
+                &[
+                    CacheIdent::TableId(view_id),
+                    CacheIdent::TableName(view_name.clone()),
+                ],
+            )
+            .await
+            .context(error::InvalidateTableCacheSnafu)?;
+
+        Ok(table)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn drop_flow(
+        &self,
+        catalog_name: String,
+        flow_name: String,
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        if let Some(flow) = self
+            .flow_metadata_manager
+            .flow_name_manager()
+            .get(&catalog_name, &flow_name)
+            .await
+            .context(error::TableMetadataManagerSnafu)?
+        {
+            let flow_id = flow.flow_id();
+            let task = DropFlowTask {
+                catalog_name,
+                flow_name,
+                flow_id,
+                drop_if_exists,
+            };
+            self.drop_flow_procedure(task, query_context).await?;
+
+            Ok(Output::new_with_affected_rows(0))
+        } else if drop_if_exists {
+            Ok(Output::new_with_affected_rows(0))
+        } else {
+            FlowNotFoundSnafu {
+                flow_name: format_full_flow_name(&catalog_name, &flow_name),
+            }
+            .fail()
+        }
+    }
+
+    async fn drop_flow_procedure(
+        &self,
+        expr: DropFlowTask,
+        query_context: QueryContextRef,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            query_context,
+            task: DdlTask::new_drop_flow(expr),
+        };
+
+        self.procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
+            .await
+            .context(error::ExecuteDdlSnafu)
+    }
+
+    /// Drop a view
+    #[tracing::instrument(skip_all)]
+    pub(crate) async fn drop_view(
+        &self,
+        catalog: String,
+        schema: String,
+        view: String,
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        let view_info = if let Some(view) = self
+            .catalog_manager
+            .table(&catalog, &schema, &view)
+            .await
+            .context(CatalogSnafu)?
+        {
+            view.table_info()
+        } else if drop_if_exists {
+            // DROP VIEW IF EXISTS meets view not found - ignored
+            return Ok(Output::new_with_affected_rows(0));
+        } else {
+            return TableNotFoundSnafu {
+                table_name: format_full_table_name(&catalog, &schema, &view),
+            }
+            .fail();
+        };
+
+        // Ensure the exists one is view, we can't drop other table types
+        ensure!(
+            view_info.table_type == TableType::View,
+            error::InvalidViewSnafu {
+                msg: "not a view",
+                view_name: format_full_table_name(&catalog, &schema, &view),
+            }
+        );
+
+        let view_id = view_info.table_id();
+
+        let task = DropViewTask {
+            catalog,
+            schema,
+            view,
+            view_id,
+            drop_if_exists,
+        };
+
+        self.drop_view_procedure(task, query_context).await?;
+
+        Ok(Output::new_with_affected_rows(0))
+    }
+
+    /// Submit [DropViewTask] to procedure executor.
+    async fn drop_view_procedure(
+        &self,
+        expr: DropViewTask,
+        query_context: QueryContextRef,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            query_context,
+            task: DdlTask::new_drop_view(expr),
+        };
+
+        self.procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
+            .await
+            .context(error::ExecuteDdlSnafu)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn alter_logical_tables(
+        &self,
+        alter_table_exprs: Vec<AlterExpr>,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        let _timer = crate::metrics::DIST_ALTER_TABLES.start_timer();
+        ensure!(
+            !alter_table_exprs.is_empty(),
+            EmptyDdlExprSnafu {
+                name: "alter logical tables"
+            }
+        );
+
+        self.alter_logical_tables_procedure(alter_table_exprs, query_context)
+            .await?;
+
+        Ok(Output::new_with_affected_rows(0))
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn drop_table(
+        &self,
+        table_name: TableName,
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        // Reserved for grpc call
+        self.drop_tables(&[table_name], drop_if_exists, query_context)
+            .await
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn drop_tables(
+        &self,
+        table_names: &[TableName],
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        let mut tables = Vec::with_capacity(table_names.len());
+        for table_name in table_names {
+            ensure!(
+                !is_readonly_schema(&table_name.schema_name),
+                SchemaReadOnlySnafu {
+                    name: table_name.schema_name.clone()
+                }
+            );
+
+            if let Some(table) = self
+                .catalog_manager
+                .table(
+                    &table_name.catalog_name,
+                    &table_name.schema_name,
+                    &table_name.table_name,
+                )
+                .await
+                .context(CatalogSnafu)?
+            {
+                tables.push(table.table_info().table_id());
+            } else if drop_if_exists {
+                // DROP TABLE IF EXISTS meets table not found - ignored
+                continue;
+            } else {
+                return TableNotFoundSnafu {
+                    table_name: table_name.to_string(),
+                }
+                .fail();
+            }
+        }
+
+        for (table_name, table_id) in table_names.iter().zip(tables.into_iter()) {
+            self.drop_table_procedure(table_name, table_id, drop_if_exists, query_context.clone())
                 .await?;
 
             // Invalidates local cache ASAP.
             self.cache_invalidator
-                .invalidate_table_id(&Context::default(), table_id)
+                .invalidate(
+                    &Context::default(),
+                    &[
+                        CacheIdent::TableId(table_id),
+                        CacheIdent::TableName(table_name.clone()),
+                    ],
+                )
                 .await
                 .context(error::InvalidateTableCacheSnafu)?;
+        }
+        Ok(Output::new_with_affected_rows(0))
+    }
 
-            self.cache_invalidator
-                .invalidate_table_name(&Context::default(), table_name.clone())
-                .await
-                .context(error::InvalidateTableCacheSnafu)?;
+    #[tracing::instrument(skip_all)]
+    pub async fn drop_database(
+        &self,
+        catalog: String,
+        schema: String,
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        ensure!(
+            !is_readonly_schema(&schema),
+            SchemaReadOnlySnafu { name: schema }
+        );
 
-            Ok(Output::new_with_affected_rows(0))
+        if self
+            .catalog_manager
+            .schema_exists(&catalog, &schema)
+            .await
+            .context(CatalogSnafu)?
+        {
+            if schema == query_context.current_schema() {
+                SchemaInUseSnafu { name: schema }.fail()
+            } else {
+                self.drop_database_procedure(catalog, schema, drop_if_exists, query_context)
+                    .await?;
+
+                Ok(Output::new_with_affected_rows(0))
+            }
         } else if drop_if_exists {
             // DROP TABLE IF EXISTS meets table not found - ignored
             Ok(Output::new_with_affected_rows(0))
         } else {
-            Err(TableNotFoundSnafu {
-                table_name: table_name.to_string(),
+            SchemaNotFoundSnafu {
+                schema_info: schema,
             }
-            .into_error(snafu::NoneError))
+            .fail()
         }
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn truncate_table(&self, table_name: TableName) -> Result<Output> {
+    pub async fn truncate_table(
+        &self,
+        table_name: TableName,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        ensure!(
+            !is_readonly_schema(&table_name.schema_name),
+            SchemaReadOnlySnafu {
+                name: table_name.schema_name.clone()
+            }
+        );
+
         let table = self
             .catalog_manager
             .table(
@@ -365,7 +866,8 @@ impl StatementExecutor {
                 table_name: table_name.to_string(),
             })?;
         let table_id = table.table_info().table_id();
-        self.truncate_table_procedure(&table_name, table_id).await?;
+        self.truncate_table_procedure(&table_name, table_id, query_context)
+            .await?;
 
         Ok(Output::new_with_affected_rows(0))
     }
@@ -396,7 +898,7 @@ impl StatementExecutor {
 
         let _ = table_info
             .meta
-            .builder_with_alter_kind(table_name, &request.alter_kind)
+            .builder_with_alter_kind(table_name, &request.alter_kind, false)
             .context(error::TableSnafu)?
             .build()
             .context(error::BuildTableMetaSnafu { table_name })?;
@@ -408,35 +910,46 @@ impl StatementExecutor {
     pub async fn alter_table(
         &self,
         alter_table: AlterTable,
-        query_ctx: QueryContextRef,
+        query_context: QueryContextRef,
     ) -> Result<Output> {
-        let expr = expr_factory::to_alter_expr(alter_table, query_ctx)?;
-        self.alter_table_inner(expr).await
+        let expr = expr_factory::to_alter_expr(alter_table, &query_context)?;
+        self.alter_table_inner(expr, query_context).await
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn alter_table_inner(&self, expr: AlterExpr) -> Result<Output> {
+    pub async fn alter_table_inner(
+        &self,
+        expr: AlterExpr,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        ensure!(
+            !is_readonly_schema(&expr.schema_name),
+            SchemaReadOnlySnafu {
+                name: expr.schema_name.clone()
+            }
+        );
+
         let catalog_name = if expr.catalog_name.is_empty() {
-            DEFAULT_CATALOG_NAME
+            DEFAULT_CATALOG_NAME.to_string()
         } else {
-            expr.catalog_name.as_str()
+            expr.catalog_name.clone()
         };
 
         let schema_name = if expr.schema_name.is_empty() {
-            DEFAULT_SCHEMA_NAME
+            DEFAULT_SCHEMA_NAME.to_string()
         } else {
-            expr.schema_name.as_str()
+            expr.schema_name.clone()
         };
 
-        let table_name = expr.table_name.as_str();
+        let table_name = expr.table_name.clone();
 
         let table = self
             .catalog_manager
-            .table(catalog_name, schema_name, table_name)
+            .table(&catalog_name, &schema_name, &table_name)
             .await
             .context(CatalogSnafu)?
             .with_context(|| TableNotFoundSnafu {
-                table_name: format_full_table_name(catalog_name, schema_name, table_name),
+                table_name: format_full_table_name(&catalog_name, &schema_name, &table_name),
             })?;
 
         let table_id = table.table_info().ident.table_id;
@@ -448,8 +961,56 @@ impl StatementExecutor {
             expr
         );
 
-        let req = SubmitDdlTaskRequest {
-            task: DdlTask::new_alter_table(expr.clone()),
+        let physical_table_id = self
+            .table_metadata_manager
+            .table_route_manager()
+            .get_physical_table_id(table_id)
+            .await
+            .context(TableMetadataManagerSnafu)?;
+
+        let (req, invalidate_keys) = if physical_table_id == table_id {
+            // This is physical table
+            let req = SubmitDdlTaskRequest {
+                query_context,
+                task: DdlTask::new_alter_table(expr),
+            };
+
+            let invalidate_keys = vec![
+                CacheIdent::TableId(table_id),
+                CacheIdent::TableName(TableName::new(catalog_name, schema_name, table_name)),
+            ];
+
+            (req, invalidate_keys)
+        } else {
+            // This is logical table
+            let req = SubmitDdlTaskRequest {
+                query_context,
+                task: DdlTask::new_alter_logical_tables(vec![expr]),
+            };
+
+            let mut invalidate_keys = vec![
+                CacheIdent::TableId(physical_table_id),
+                CacheIdent::TableId(table_id),
+                CacheIdent::TableName(TableName::new(catalog_name, schema_name, table_name)),
+            ];
+
+            let physical_table = self
+                .table_metadata_manager
+                .table_info_manager()
+                .get(physical_table_id)
+                .await
+                .context(TableMetadataManagerSnafu)?
+                .map(|x| x.into_inner());
+            if let Some(physical_table) = physical_table {
+                let physical_table_name = TableName::new(
+                    physical_table.table_info.catalog_name,
+                    physical_table.table_info.schema_name,
+                    physical_table.table_info.name,
+                );
+                invalidate_keys.push(CacheIdent::TableName(physical_table_name));
+            }
+
+            (req, invalidate_keys)
         };
 
         self.procedure_executor
@@ -459,15 +1020,7 @@ impl StatementExecutor {
 
         // Invalidates local cache ASAP.
         self.cache_invalidator
-            .invalidate_table_id(&Context::default(), table_id)
-            .await
-            .context(error::InvalidateTableCacheSnafu)?;
-
-        self.cache_invalidator
-            .invalidate_table_name(
-                &Context::default(),
-                TableName::new(catalog_name, schema_name, table_name),
-            )
+            .invalidate(&Context::default(), &invalidate_keys)
             .await
             .context(error::InvalidateTableCacheSnafu)?;
 
@@ -479,10 +1032,12 @@ impl StatementExecutor {
         create_table: CreateTableExpr,
         partitions: Vec<Partition>,
         table_info: RawTableInfo,
+        query_context: QueryContextRef,
     ) -> Result<SubmitDdlTaskResponse> {
         let partitions = partitions.into_iter().map(Into::into).collect();
 
         let request = SubmitDdlTaskRequest {
+            query_context,
             task: DdlTask::new_create_table(create_table, partitions, table_info),
         };
 
@@ -495,9 +1050,27 @@ impl StatementExecutor {
     async fn create_logical_tables_procedure(
         &self,
         tables_data: Vec<(CreateTableExpr, RawTableInfo)>,
+        query_context: QueryContextRef,
     ) -> Result<SubmitDdlTaskResponse> {
         let request = SubmitDdlTaskRequest {
+            query_context,
             task: DdlTask::new_create_logical_tables(tables_data),
+        };
+
+        self.procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
+            .await
+            .context(error::ExecuteDdlSnafu)
+    }
+
+    async fn alter_logical_tables_procedure(
+        &self,
+        tables_data: Vec<AlterExpr>,
+        query_context: QueryContextRef,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            query_context,
+            task: DdlTask::new_alter_logical_tables(tables_data),
         };
 
         self.procedure_executor
@@ -511,8 +1084,10 @@ impl StatementExecutor {
         table_name: &TableName,
         table_id: TableId,
         drop_if_exists: bool,
+        query_context: QueryContextRef,
     ) -> Result<SubmitDdlTaskResponse> {
         let request = SubmitDdlTaskRequest {
+            query_context,
             task: DdlTask::new_drop_table(
                 table_name.catalog_name.to_string(),
                 table_name.schema_name.to_string(),
@@ -528,12 +1103,32 @@ impl StatementExecutor {
             .context(error::ExecuteDdlSnafu)
     }
 
+    async fn drop_database_procedure(
+        &self,
+        catalog: String,
+        schema: String,
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            query_context,
+            task: DdlTask::new_drop_database(catalog, schema, drop_if_exists),
+        };
+
+        self.procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
+            .await
+            .context(error::ExecuteDdlSnafu)
+    }
+
     async fn truncate_table_procedure(
         &self,
         table_name: &TableName,
         table_id: TableId,
+        query_context: QueryContextRef,
     ) -> Result<SubmitDdlTaskResponse> {
         let request = SubmitDdlTaskRequest {
+            query_context,
             task: DdlTask::new_truncate_table(
                 table_name.catalog_name.to_string(),
                 table_name.schema_name.to_string(),
@@ -551,10 +1146,12 @@ impl StatementExecutor {
     #[tracing::instrument(skip_all)]
     pub async fn create_database(
         &self,
-        catalog: &str,
         database: &str,
         create_if_not_exists: bool,
+        options: HashMap<String, String>,
+        query_context: QueryContextRef,
     ) -> Result<Output> {
+        let catalog = query_context.current_catalog();
         ensure!(
             NAME_PATTERN_REG.is_match(catalog),
             error::UnexpectedSnafu {
@@ -569,30 +1166,46 @@ impl StatementExecutor {
             }
         );
 
-        // TODO(weny): considers executing it in the procedures.
-        let schema_key = SchemaNameKey::new(catalog, database);
-        let exists = self
-            .table_metadata_manager
-            .schema_manager()
-            .exists(schema_key)
+        if !self
+            .catalog_manager
+            .schema_exists(catalog, database)
             .await
-            .context(TableMetadataManagerSnafu)?;
+            .context(CatalogSnafu)?
+        {
+            self.create_database_procedure(
+                catalog.to_string(),
+                database.to_string(),
+                create_if_not_exists,
+                options,
+                query_context,
+            )
+            .await?;
 
-        if exists {
-            return if create_if_not_exists {
-                Ok(Output::new_with_affected_rows(1))
-            } else {
-                error::SchemaExistsSnafu { name: database }.fail()
-            };
+            Ok(Output::new_with_affected_rows(1))
+        } else if create_if_not_exists {
+            Ok(Output::new_with_affected_rows(1))
+        } else {
+            error::SchemaExistsSnafu { name: database }.fail()
         }
+    }
 
-        self.table_metadata_manager
-            .schema_manager()
-            .create(schema_key, None, false)
+    async fn create_database_procedure(
+        &self,
+        catalog: String,
+        database: String,
+        create_if_not_exists: bool,
+        options: HashMap<String, String>,
+        query_context: QueryContextRef,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            query_context,
+            task: DdlTask::new_create_database(catalog, database, create_if_not_exists, options),
+        };
+
+        self.procedure_executor
+            .submit_ddl_task(&ExecutorContext::default(), request)
             .await
-            .context(TableMetadataManagerSnafu)?;
-
-        Ok(Output::new_with_affected_rows(1))
+            .context(error::ExecuteDdlSnafu)
     }
 }
 
@@ -623,6 +1236,18 @@ fn parse_partitions(
     let partition_columns = find_partition_columns(&partitions)?;
     let partition_entries =
         find_partition_entries(create_table, &partitions, &partition_columns, query_ctx)?;
+
+    // Validates partition
+    let mut exprs = vec![];
+    for partition in &partition_entries {
+        for bound in partition {
+            if let PartitionBound::Expr(expr) = bound {
+                exprs.push(expr.clone());
+            }
+        }
+    }
+    MultiDimPartitionRule::try_new(partition_columns.clone(), vec![], exprs)
+        .context(InvalidPartitionSnafu)?;
 
     Ok((
         partition_entries
@@ -684,7 +1309,7 @@ fn create_table_info(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let table_options = TableOptions::try_from(&create_table.table_options)
+    let table_options = TableOptions::try_from_iter(&create_table.table_options)
         .context(UnrecognizedTableOptionSnafu)?;
     let table_options = merge_options(table_options, schema_opts);
 
@@ -701,7 +1326,7 @@ fn create_table_info(
     };
 
     let desc = if create_table.desc.is_empty() {
-        None
+        create_table.table_options.get(COMMENT_KEY).cloned()
     } else {
         Some(create_table.desc.clone())
     };
@@ -806,14 +1431,30 @@ fn convert_one_expr(
 
     // convert leaf node.
     let (lhs, op, rhs) = match (left.as_ref(), right.as_ref()) {
+        // col, val
         (Expr::Identifier(ident), Expr::Value(value)) => {
             let (column_name, data_type) = convert_identifier(ident, column_name_and_type)?;
-            let value = convert_value(value, data_type, timezone)?;
+            let value = convert_value(value, data_type, timezone, None)?;
             (Operand::Column(column_name), op, Operand::Value(value))
         }
+        (Expr::Identifier(ident), Expr::UnaryOp { op: unary_op, expr })
+            if let Expr::Value(v) = &**expr =>
+        {
+            let (column_name, data_type) = convert_identifier(ident, column_name_and_type)?;
+            let value = convert_value(v, data_type, timezone, Some(*unary_op))?;
+            (Operand::Column(column_name), op, Operand::Value(value))
+        }
+        // val, col
         (Expr::Value(value), Expr::Identifier(ident)) => {
             let (column_name, data_type) = convert_identifier(ident, column_name_and_type)?;
-            let value = convert_value(value, data_type, timezone)?;
+            let value = convert_value(value, data_type, timezone, None)?;
+            (Operand::Value(value), op, Operand::Column(column_name))
+        }
+        (Expr::UnaryOp { op: unary_op, expr }, Expr::Identifier(ident))
+            if let Expr::Value(v) = &**expr =>
+        {
+            let (column_name, data_type) = convert_identifier(ident, column_name_and_type)?;
+            let value = convert_value(v, data_type, timezone, Some(*unary_op))?;
             (Operand::Value(value), op, Operand::Column(column_name))
         }
         (Expr::BinaryOp { .. }, Expr::BinaryOp { .. }) => {
@@ -849,8 +1490,10 @@ fn convert_value(
     value: &ParserValue,
     data_type: ConcreteDataType,
     timezone: &Timezone,
+    unary_op: Option<UnaryOperator>,
 ) -> Result<Value> {
-    sql_value_to_value("<NONAME>", &data_type, value, Some(timezone)).context(ParseSqlValueSnafu)
+    sql_value_to_value("<NONAME>", &data_type, value, Some(timezone), unary_op)
+        .context(ParseSqlValueSnafu)
 }
 
 /// Merge table level table options with schema level table options.
@@ -897,7 +1540,7 @@ mod test {
                 .unwrap_err()
                 .to_string(),
             "Invalid partition columns when creating table 'my_table', \
-            reason: partition column must belongs to primary keys or equals to time index",
+             reason: partition column must belongs to primary keys or equals to time index",
         );
     }
 
@@ -930,7 +1573,7 @@ ENGINE=mito",
                 r#"[{"column_list":["b","a"],"value_list":["{\"Value\":{\"String\":\"hz\"}}","{\"Value\":{\"Int32\":10}}"]},{"column_list":["b","a"],"value_list":["{\"Value\":{\"String\":\"sh\"}}","{\"Value\":{\"Int32\":20}}"]},{"column_list":["b","a"],"value_list":["\"MaxValue\"","\"MaxValue\""]}]"#,
             ),
         ];
-        let ctx = QueryContextBuilder::default().build();
+        let ctx = QueryContextBuilder::default().build().into();
         for (sql, expected) in cases {
             let result = ParserContext::create_with_dialect(
                 sql,
@@ -940,7 +1583,7 @@ ENGINE=mito",
             .unwrap();
             match &result[0] {
                 Statement::CreateTable(c) => {
-                    let expr = expr_factory::create_to_expr(c, QueryContext::arc()).unwrap();
+                    let expr = expr_factory::create_to_expr(c, &QueryContext::arc()).unwrap();
                     let (partitions, _) =
                         parse_partitions(&expr, c.partitions.clone(), &ctx).unwrap();
                     let json = serde_json::to_string(&partitions).unwrap();

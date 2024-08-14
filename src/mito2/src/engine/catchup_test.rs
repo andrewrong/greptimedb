@@ -104,7 +104,7 @@ async fn test_catchup_with_last_entry_id() {
     // Scans
     let request = ScanRequest::default();
     let stream = follower_engine
-        .handle_query(region_id, request)
+        .scan_to_stream(region_id, request)
         .await
         .unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();
@@ -264,7 +264,7 @@ async fn test_catchup_without_last_entry_id() {
 
     let request = ScanRequest::default();
     let stream = follower_engine
-        .handle_query(region_id, request)
+        .scan_to_stream(region_id, request)
         .await
         .unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();
@@ -345,7 +345,7 @@ async fn test_catchup_with_manifest_update() {
     // Ensures the mutable is empty.
     assert!(region.version().memtables.mutable.is_empty());
 
-    let manifest = region.manifest_manager.manifest().await;
+    let manifest = region.manifest_ctx.manifest().await;
     assert_eq!(manifest.manifest_version, 0);
 
     let resp = follower_engine
@@ -361,13 +361,13 @@ async fn test_catchup_with_manifest_update() {
 
     // The inner region was replaced. We must get it again.
     let region = follower_engine.get_region(region_id).unwrap();
-    let manifest = region.manifest_manager.manifest().await;
+    let manifest = region.manifest_ctx.manifest().await;
     assert_eq!(manifest.manifest_version, 2);
     assert!(!region.is_writable());
 
     let request = ScanRequest::default();
     let stream = follower_engine
-        .handle_query(region_id, request)
+        .scan_to_stream(region_id, request)
         .await
         .unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();

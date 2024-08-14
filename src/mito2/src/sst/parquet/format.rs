@@ -15,7 +15,7 @@
 //! Format to store in parquet.
 //!
 //! We store three internal columns in parquet:
-//! - `__primary_key`, the primary key of the row (tags). Type: dictionary(uint16, binary)
+//! - `__primary_key`, the primary key of the row (tags). Type: dictionary(uint32, binary)
 //! - `__sequence`, the sequence number of a row. Type: uint64
 //! - `__op_type`, the op type of the row. Type: uint8
 //!
@@ -32,20 +32,15 @@ use std::sync::Arc;
 
 use api::v1::SemanticType;
 use datafusion_common::ScalarValue;
-use datatypes::arrow::array::{ArrayRef, BinaryArray, DictionaryArray, UInt16Array, UInt64Array};
-use datatypes::arrow::datatypes::{
-    DataType as ArrowDataType, Field, FieldRef, Fields, Schema, SchemaRef, UInt16Type,
-};
+use datatypes::arrow::array::{ArrayRef, BinaryArray, DictionaryArray, UInt32Array, UInt64Array};
+use datatypes::arrow::datatypes::{SchemaRef, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::DataType;
 use datatypes::vectors::{Helper, Vector};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 use snafu::{ensure, OptionExt, ResultExt};
-use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
-use store_api::storage::consts::{
-    OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
-};
+use store_api::metadata::{ColumnMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
 use crate::error::{
@@ -53,6 +48,10 @@ use crate::error::{
 };
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+use crate::sst::to_sst_arrow_schema;
+
+/// Arrow array type for the primary key dictionary.
+pub(crate) type PrimaryKeyArray = DictionaryArray<UInt32Type>;
 
 /// Number of columns that have fixed positions.
 ///
@@ -77,8 +76,8 @@ impl WriteFormat {
     }
 
     /// Gets the arrow schema to store in parquet.
-    pub(crate) fn arrow_schema(&self) -> SchemaRef {
-        self.arrow_schema.clone()
+    pub(crate) fn arrow_schema(&self) -> &SchemaRef {
+        &self.arrow_schema
     }
 
     /// Convert `batch` to a arrow record batch to store in parquet.
@@ -114,23 +113,26 @@ impl WriteFormat {
 }
 
 /// Helper for reading the SST format.
-pub(crate) struct ReadFormat {
+pub struct ReadFormat {
     metadata: RegionMetadataRef,
     /// SST file schema.
     arrow_schema: SchemaRef,
     /// Field column id to its index in `schema` (SST schema).
     /// In SST schema, fields are stored in the front of the schema.
     field_id_to_index: HashMap<ColumnId, usize>,
+    /// Indices of columns to read from the SST. It contains all internal columns.
+    projection_indices: Vec<usize>,
     /// Field column id to their index in the projected schema (
     /// the schema of [Batch]).
-    ///
-    /// This field is set at the first call to [convert_record_batch](Self::convert_record_batch).
-    field_id_to_projected_index: Option<HashMap<ColumnId, usize>>,
+    field_id_to_projected_index: HashMap<ColumnId, usize>,
 }
 
 impl ReadFormat {
-    /// Creates a helper with existing `metadata`.
-    pub(crate) fn new(metadata: RegionMetadataRef) -> ReadFormat {
+    /// Creates a helper with existing `metadata` and `column_ids` to read.
+    pub fn new(
+        metadata: RegionMetadataRef,
+        column_ids: impl Iterator<Item = ColumnId>,
+    ) -> ReadFormat {
         let field_id_to_index: HashMap<_, _> = metadata
             .field_columns()
             .enumerate()
@@ -138,11 +140,42 @@ impl ReadFormat {
             .collect();
         let arrow_schema = to_sst_arrow_schema(&metadata);
 
+        // Maps column id of a projected field to its index in SST.
+        let mut projected_field_id_index: Vec<_> = column_ids
+            .filter_map(|column_id| {
+                // Only apply projection to fields.
+                field_id_to_index
+                    .get(&column_id)
+                    .copied()
+                    .map(|index| (column_id, index))
+            })
+            .collect();
+        let mut projection_indices: Vec<_> = projected_field_id_index
+            .iter()
+            .map(|(_column_id, index)| *index)
+            // We need to add all fixed position columns.
+            .chain(arrow_schema.fields.len() - FIXED_POS_COLUMN_NUM..arrow_schema.fields.len())
+            .collect();
+        projection_indices.sort_unstable();
+
+        // Sort fields by their indices in the SST. Then the order of fields is their order
+        // in the Batch.
+        projected_field_id_index.sort_unstable_by_key(|x| x.1);
+        // Because the SST put fields before other columns, we don't need to consider other
+        // columns.
+        let field_id_to_projected_index = projected_field_id_index
+            .into_iter()
+            .map(|(column_id, _)| column_id)
+            .enumerate()
+            .map(|(index, column_id)| (column_id, index))
+            .collect();
+
         ReadFormat {
             metadata,
             arrow_schema,
             field_id_to_index,
-            field_id_to_projected_index: None,
+            projection_indices,
+            field_id_to_projected_index,
         }
     }
 
@@ -159,35 +192,16 @@ impl ReadFormat {
         &self.metadata
     }
 
-    /// Gets sorted projection indices to read `columns` from parquet files.
-    ///
-    /// This function ignores columns not in `metadata` to for compatibility between
-    /// different schemas.
-    pub(crate) fn projection_indices(
-        &self,
-        columns: impl IntoIterator<Item = ColumnId>,
-    ) -> Vec<usize> {
-        let mut indices: Vec<_> = columns
-            .into_iter()
-            .filter_map(|column_id| {
-                // Only apply projection to fields.
-                self.field_id_to_index.get(&column_id).copied()
-            })
-            // We need to add all fixed position columns.
-            .chain(
-                self.arrow_schema.fields.len() - FIXED_POS_COLUMN_NUM
-                    ..self.arrow_schema.fields.len(),
-            )
-            .collect();
-        indices.sort_unstable();
-        indices
+    /// Gets sorted projection indices to read.
+    pub(crate) fn projection_indices(&self) -> &[usize] {
+        &self.projection_indices
     }
 
     /// Convert a arrow record batch into `batches`.
     ///
     /// Note that the `record_batch` may only contains a subset of columns if it is projected.
-    pub(crate) fn convert_record_batch(
-        &mut self,
+    pub fn convert_record_batch(
+        &self,
         record_batch: &RecordBatch,
         batches: &mut VecDeque<Batch>,
     ) -> Result<()> {
@@ -204,10 +218,6 @@ impl ReadFormat {
             }
         );
 
-        if self.field_id_to_projected_index.is_none() {
-            self.init_id_to_projected_index(record_batch);
-        }
-
         let mut fixed_pos_columns = record_batch
             .columns()
             .iter()
@@ -223,7 +233,7 @@ impl ReadFormat {
         // Compute primary key offsets.
         let pk_dict_array = pk_array
             .as_any()
-            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .downcast_ref::<PrimaryKeyArray>()
             .with_context(|| InvalidRecordBatchSnafu {
                 reason: format!("primary key array should not be {:?}", pk_array.data_type()),
             })?;
@@ -248,7 +258,7 @@ impl ReadFormat {
             let end = offsets[i + 1];
             let rows_in_batch = end - start;
             let dict_key = keys.value(*start);
-            let primary_key = pk_values.value(dict_key.into()).to_vec();
+            let primary_key = pk_values.value(dict_key as usize).to_vec();
 
             let mut builder = BatchBuilder::new(primary_key);
             builder
@@ -270,21 +280,8 @@ impl ReadFormat {
         Ok(())
     }
 
-    fn init_id_to_projected_index(&mut self, record_batch: &RecordBatch) {
-        let mut name_to_projected_index = HashMap::new();
-        for (index, field) in record_batch.schema().fields().iter().enumerate() {
-            let Some(column) = self.metadata.column_by_name(field.name()) else {
-                continue;
-            };
-            if column.semantic_type == SemanticType::Field {
-                name_to_projected_index.insert(column.column_id, index);
-            }
-        }
-        self.field_id_to_projected_index = Some(name_to_projected_index);
-    }
-
     /// Returns min values of specific column in row groups.
-    pub(crate) fn min_values(
+    pub fn min_values(
         &self,
         row_groups: &[impl Borrow<RowGroupMetaData>],
         column_id: ColumnId,
@@ -304,7 +301,7 @@ impl ReadFormat {
     }
 
     /// Returns max values of specific column in row groups.
-    pub(crate) fn max_values(
+    pub fn max_values(
         &self,
         row_groups: &[impl Borrow<RowGroupMetaData>],
         column_id: ColumnId,
@@ -324,7 +321,7 @@ impl ReadFormat {
     }
 
     /// Returns null counts of specific column in row groups.
-    pub(crate) fn null_counts(
+    pub fn null_counts(
         &self,
         row_groups: &[impl Borrow<RowGroupMetaData>],
         column_id: ColumnId,
@@ -513,42 +510,24 @@ impl ReadFormat {
     }
 
     /// Index of a field column by its column id.
-    /// This function is only available after the first call to
-    /// [convert_record_batch](Self::convert_record_batch). Otherwise
-    /// it always return `None`
     pub fn field_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
-        self.field_id_to_projected_index
-            .as_ref()
-            .and_then(|m| m.get(&column_id).copied())
+        self.field_id_to_projected_index.get(&column_id).copied()
     }
 }
 
-/// Gets the arrow schema to store in parquet.
-fn to_sst_arrow_schema(metadata: &RegionMetadata) -> SchemaRef {
-    let fields = Fields::from_iter(
-        metadata
-            .schema
-            .arrow_schema()
-            .fields()
-            .iter()
-            .zip(&metadata.column_metadatas)
-            .filter_map(|(field, column_meta)| {
-                if column_meta.semantic_type == SemanticType::Field {
-                    Some(field.clone())
-                } else {
-                    // We have fixed positions for tags (primary key) and time index.
-                    None
-                }
-            })
-            .chain([metadata.time_index_field()])
-            .chain(internal_fields()),
-    );
-
-    Arc::new(Schema::new(fields))
+#[cfg(test)]
+impl ReadFormat {
+    /// Creates a helper with existing `metadata` and all columns.
+    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> ReadFormat {
+        Self::new(
+            Arc::clone(&metadata),
+            metadata.column_metadatas.iter().map(|c| c.column_id),
+        )
+    }
 }
 
 /// Compute offsets of different primary keys in the array.
-fn primary_key_offsets(pk_dict_array: &DictionaryArray<UInt16Type>) -> Result<Vec<usize>> {
+fn primary_key_offsets(pk_dict_array: &PrimaryKeyArray) -> Result<Vec<usize>> {
     if pk_dict_array.is_empty() {
         return Ok(Vec::new());
     }
@@ -570,29 +549,10 @@ fn primary_key_offsets(pk_dict_array: &DictionaryArray<UInt16Type>) -> Result<Ve
     Ok(offsets)
 }
 
-/// Fields for internal columns.
-fn internal_fields() -> [FieldRef; 3] {
-    // Internal columns are always not null.
-    [
-        Arc::new(Field::new_dictionary(
-            PRIMARY_KEY_COLUMN_NAME,
-            ArrowDataType::UInt16,
-            ArrowDataType::Binary,
-            false,
-        )),
-        Arc::new(Field::new(
-            SEQUENCE_COLUMN_NAME,
-            ArrowDataType::UInt64,
-            false,
-        )),
-        Arc::new(Field::new(OP_TYPE_COLUMN_NAME, ArrowDataType::UInt8, false)),
-    ]
-}
-
 /// Creates a new array for specific `primary_key`.
 fn new_primary_key_array(primary_key: &[u8], num_rows: usize) -> ArrayRef {
     let values = Arc::new(BinaryArray::from_iter_values([primary_key]));
-    let keys = UInt16Array::from_value(0, num_rows);
+    let keys = UInt32Array::from_value(0, num_rows);
 
     // Safety: The key index is valid.
     Arc::new(DictionaryArray::new(keys, values))
@@ -602,7 +562,7 @@ fn new_primary_key_array(primary_key: &[u8], num_rows: usize) -> ArrayRef {
 mod tests {
     use api::v1::OpType;
     use datatypes::arrow::array::{Int64Array, TimestampMillisecondArray, UInt64Array, UInt8Array};
-    use datatypes::arrow::datatypes::TimeUnit;
+    use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit};
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnSchema;
     use datatypes::vectors::{Int64Vector, TimestampMillisecondVector, UInt64Vector, UInt8Vector};
@@ -670,7 +630,7 @@ mod tests {
             Field::new(
                 "__primary_key",
                 ArrowDataType::Dictionary(
-                    Box::new(ArrowDataType::UInt16),
+                    Box::new(ArrowDataType::UInt32),
                     Box::new(ArrowDataType::Binary),
                 ),
                 false,
@@ -707,7 +667,7 @@ mod tests {
     fn test_to_sst_arrow_schema() {
         let metadata = build_test_region_metadata();
         let write_format = WriteFormat::new(metadata);
-        assert_eq!(build_test_arrow_schema(), write_format.arrow_schema());
+        assert_eq!(&build_test_arrow_schema(), write_format.arrow_schema());
     }
 
     #[test]
@@ -717,15 +677,15 @@ mod tests {
         assert_eq!(&expect, &array);
     }
 
-    fn build_test_pk_array(pk_row_nums: &[(Vec<u8>, usize)]) -> Arc<DictionaryArray<UInt16Type>> {
+    fn build_test_pk_array(pk_row_nums: &[(Vec<u8>, usize)]) -> Arc<PrimaryKeyArray> {
         let values = Arc::new(BinaryArray::from_iter_values(
             pk_row_nums.iter().map(|v| &v.0),
         ));
         let mut keys = vec![];
         for (index, num_rows) in pk_row_nums.iter().map(|v| v.1).enumerate() {
-            keys.extend(std::iter::repeat(index as u16).take(num_rows));
+            keys.extend(std::iter::repeat(index as u32).take(num_rows));
         }
-        let keys = UInt16Array::from(keys);
+        let keys = UInt32Array::from(keys);
         Arc::new(DictionaryArray::new(keys, values))
     }
 
@@ -753,18 +713,18 @@ mod tests {
     #[test]
     fn test_projection_indices() {
         let metadata = build_test_region_metadata();
-        let read_format = ReadFormat::new(metadata);
         // Only read tag1
-        assert_eq!(vec![2, 3, 4, 5], read_format.projection_indices([3]));
+        let read_format = ReadFormat::new(metadata.clone(), [3].iter().copied());
+        assert_eq!(&[2, 3, 4, 5], read_format.projection_indices());
         // Only read field1
-        assert_eq!(vec![0, 2, 3, 4, 5], read_format.projection_indices([4]));
+        let read_format = ReadFormat::new(metadata.clone(), [4].iter().copied());
+        assert_eq!(&[0, 2, 3, 4, 5], read_format.projection_indices());
         // Only read ts
-        assert_eq!(vec![2, 3, 4, 5], read_format.projection_indices([5]));
+        let read_format = ReadFormat::new(metadata.clone(), [5].iter().copied());
+        assert_eq!(&[2, 3, 4, 5], read_format.projection_indices());
         // Read field0, tag0, ts
-        assert_eq!(
-            vec![1, 2, 3, 4, 5],
-            read_format.projection_indices([2, 1, 5])
-        );
+        let read_format = ReadFormat::new(metadata, [2, 1, 5].iter().copied());
+        assert_eq!(&[1, 2, 3, 4, 5], read_format.projection_indices());
     }
 
     #[test]
@@ -805,7 +765,12 @@ mod tests {
     fn test_convert_empty_record_batch() {
         let metadata = build_test_region_metadata();
         let arrow_schema = build_test_arrow_schema();
-        let mut read_format = ReadFormat::new(metadata);
+        let column_ids: Vec<_> = metadata
+            .column_metadatas
+            .iter()
+            .map(|col| col.column_id)
+            .collect();
+        let read_format = ReadFormat::new(metadata, column_ids.iter().copied());
         assert_eq!(arrow_schema, *read_format.arrow_schema());
 
         let record_batch = RecordBatch::new_empty(arrow_schema);
@@ -819,7 +784,12 @@ mod tests {
     #[test]
     fn test_convert_record_batch() {
         let metadata = build_test_region_metadata();
-        let mut read_format = ReadFormat::new(metadata);
+        let column_ids: Vec<_> = metadata
+            .column_metadatas
+            .iter()
+            .map(|col| col.column_id)
+            .collect();
+        let read_format = ReadFormat::new(metadata, column_ids.iter().copied());
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![1, 1, 10, 10])), // field1

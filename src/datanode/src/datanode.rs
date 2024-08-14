@@ -25,17 +25,15 @@ use common_meta::key::datanode_table::{DatanodeTableManager, DatanodeTableValue}
 use common_meta::kv_backend::KvBackendRef;
 use common_meta::wal_options_allocator::prepare_wal_options;
 pub use common_procedure::options::ProcedureConfig;
-use common_runtime::Runtime;
 use common_telemetry::{error, info, warn};
 use common_wal::config::kafka::DatanodeKafkaConfig;
 use common_wal::config::raft_engine::RaftEngineConfig;
 use common_wal::config::DatanodeWalConfig;
 use file_engine::engine::FileRegionEngine;
-use futures_util::future::try_join_all;
 use futures_util::TryStreamExt;
 use log_store::kafka::log_store::KafkaLogStore;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
-use meta_client::client::MetaClient;
+use meta_client::MetaClientRef;
 use metric_engine::engine::MetricEngine;
 use mito2::config::MitoConfig;
 use mito2::engine::MitoEngine;
@@ -45,19 +43,19 @@ use query::QueryEngineFactory;
 use servers::export_metrics::ExportMetricsTask;
 use servers::server::ServerHandlers;
 use servers::Mode;
-use snafu::{OptionExt, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 use store_api::path_utils::{region_dir, WAL_DIR};
 use store_api::region_engine::RegionEngineRef;
-use store_api::region_request::{RegionOpenRequest, RegionRequest};
+use store_api::region_request::RegionOpenRequest;
 use store_api::storage::RegionId;
 use tokio::fs;
 use tokio::sync::Notify;
 
-use crate::config::{DatanodeOptions, RegionEngineConfig};
+use crate::config::{DatanodeOptions, RegionEngineConfig, StorageConfig};
 use crate::error::{
-    BuildMitoEngineSnafu, CreateDirSnafu, GetMetadataSnafu, MissingKvBackendSnafu,
-    MissingNodeIdSnafu, OpenLogStoreSnafu, Result, RuntimeResourceSnafu, ShutdownInstanceSnafu,
-    ShutdownServerSnafu, StartServerSnafu,
+    self, BuildMitoEngineSnafu, CreateDirSnafu, GetMetadataSnafu, MissingKvBackendSnafu,
+    MissingNodeIdSnafu, OpenLogStoreSnafu, Result, ShutdownInstanceSnafu, ShutdownServerSnafu,
+    StartServerSnafu,
 };
 use crate::event_listener::{
     new_region_server_event_channel, NoopRegionServerEventListener, RegionServerEventListenerRef,
@@ -67,8 +65,6 @@ use crate::greptimedb_telemetry::get_greptimedb_telemetry_task;
 use crate::heartbeat::HeartbeatTask;
 use crate::region_server::{DummyTableProviderFactory, RegionServer};
 use crate::store;
-
-const OPEN_REGION_PARALLELISM: usize = 16;
 
 /// Datanode service.
 pub struct Datanode {
@@ -139,7 +135,6 @@ impl Datanode {
         if let Some(heartbeat_task) = &self.heartbeat_task {
             heartbeat_task
                 .close()
-                .await
                 .map_err(BoxedError::new)
                 .context(ShutdownInstanceSnafu)?;
         }
@@ -159,7 +154,7 @@ impl Datanode {
 pub struct DatanodeBuilder {
     opts: DatanodeOptions,
     plugins: Plugins,
-    meta_client: Option<MetaClient>,
+    meta_client: Option<MetaClientRef>,
     kv_backend: Option<KvBackendRef>,
 }
 
@@ -175,7 +170,7 @@ impl DatanodeBuilder {
         }
     }
 
-    pub fn with_meta_client(self, meta_client: MetaClient) -> Self {
+    pub fn with_meta_client(self, meta_client: MetaClientRef) -> Self {
         Self {
             meta_client: Some(meta_client),
             ..self
@@ -219,12 +214,16 @@ impl DatanodeBuilder {
             .await
             .context(GetMetadataSnafu)?;
 
-        let open_all_regions =
-            open_all_regions(region_server.clone(), table_values, !controlled_by_metasrv);
+        let open_all_regions = open_all_regions(
+            region_server.clone(),
+            table_values,
+            !controlled_by_metasrv,
+            self.opts.init_regions_parallelism,
+        );
 
         if self.opts.init_regions_in_background {
             // Opens regions in background.
-            common_runtime::spawn_bg(async move {
+            common_runtime::spawn_global(async move {
                 if let Err(err) = open_all_regions.await {
                     error!(err; "Failed to open regions during the startup.");
                 }
@@ -269,6 +268,20 @@ impl DatanodeBuilder {
         })
     }
 
+    /// Builds [ObjectStoreManager] from [StorageConfig].
+    pub async fn build_object_store_manager(cfg: &StorageConfig) -> Result<ObjectStoreManagerRef> {
+        let object_store = store::new_object_store(cfg.store.clone(), &cfg.data_home).await?;
+        let default_name = cfg.store.name();
+        let mut object_store_manager = ObjectStoreManager::new(default_name, object_store);
+        for store in &cfg.providers {
+            object_store_manager.add(
+                store.name(),
+                store::new_object_store(store.clone(), &cfg.data_home).await?,
+            );
+        }
+        Ok(Arc::new(object_store_manager))
+    }
+
     #[cfg(test)]
     /// Open all regions belong to this datanode.
     async fn initialize_region_server(
@@ -286,7 +299,13 @@ impl DatanodeBuilder {
             .await
             .context(GetMetadataSnafu)?;
 
-        open_all_regions(region_server.clone(), table_values, open_with_writable).await
+        open_all_regions(
+            region_server.clone(),
+            table_values,
+            open_with_writable,
+            self.opts.init_regions_parallelism,
+        )
+        .await
     }
 
     async fn new_region_server(
@@ -301,29 +320,23 @@ impl DatanodeBuilder {
             None,
             None,
             None,
+            None,
             false,
             self.plugins.clone(),
         );
         let query_engine = query_engine_factory.query_engine();
 
-        let runtime = Arc::new(
-            Runtime::builder()
-                .worker_threads(opts.rpc_runtime_size)
-                .thread_name("io-handlers")
-                .build()
-                .context(RuntimeResourceSnafu)?,
-        );
-
         let table_provider_factory = Arc::new(DummyTableProviderFactory);
         let mut region_server = RegionServer::with_table_provider(
             query_engine,
-            runtime,
+            common_runtime::global_runtime(),
             event_listener,
             table_provider_factory,
         );
 
-        let object_store_manager = Self::build_object_store_manager(opts).await?;
-        let engines = Self::build_store_engines(opts, object_store_manager).await?;
+        let object_store_manager = Self::build_object_store_manager(&opts.storage).await?;
+        let engines =
+            Self::build_store_engines(opts, object_store_manager, self.plugins.clone()).await?;
         for engine in engines {
             region_server.register_engine(engine);
         }
@@ -337,14 +350,19 @@ impl DatanodeBuilder {
     async fn build_store_engines(
         opts: &DatanodeOptions,
         object_store_manager: ObjectStoreManagerRef,
+        plugins: Plugins,
     ) -> Result<Vec<RegionEngineRef>> {
         let mut engines = vec![];
         for engine in &opts.region_engine {
             match engine {
                 RegionEngineConfig::Mito(config) => {
-                    let mito_engine =
-                        Self::build_mito_engine(opts, object_store_manager.clone(), config.clone())
-                            .await?;
+                    let mito_engine = Self::build_mito_engine(
+                        opts,
+                        object_store_manager.clone(),
+                        config.clone(),
+                        plugins.clone(),
+                    )
+                    .await?;
 
                     let metric_engine = MetricEngine::new(mito_engine.clone());
                     engines.push(Arc::new(mito_engine) as _);
@@ -367,6 +385,7 @@ impl DatanodeBuilder {
         opts: &DatanodeOptions,
         object_store_manager: ObjectStoreManagerRef,
         config: MitoConfig,
+        plugins: Plugins,
     ) -> Result<MitoEngine> {
         let mito_engine = match &opts.wal {
             DatanodeWalConfig::RaftEngine(raft_engine_config) => MitoEngine::new(
@@ -375,6 +394,7 @@ impl DatanodeBuilder {
                 Self::build_raft_engine_log_store(&opts.storage.data_home, raft_engine_config)
                     .await?,
                 object_store_manager,
+                plugins,
             )
             .await
             .context(BuildMitoEngineSnafu)?,
@@ -383,6 +403,7 @@ impl DatanodeBuilder {
                 config,
                 Self::build_kafka_log_store(kafka_config).await?,
                 object_store_manager,
+                plugins,
             )
             .await
             .context(BuildMitoEngineSnafu)?,
@@ -425,21 +446,6 @@ impl DatanodeBuilder {
             .context(OpenLogStoreSnafu)
             .map(Arc::new)
     }
-
-    /// Builds [ObjectStoreManager]
-    async fn build_object_store_manager(opts: &DatanodeOptions) -> Result<ObjectStoreManagerRef> {
-        let object_store =
-            store::new_object_store(opts.storage.store.clone(), &opts.storage.data_home).await?;
-        let default_name = opts.storage.store.name();
-        let mut object_store_manager = ObjectStoreManager::new(default_name, object_store);
-        for store in &opts.storage.providers {
-            object_store_manager.add(
-                store.name(),
-                store::new_object_store(store.clone(), &opts.storage.data_home).await?,
-            );
-        }
-        Ok(Arc::new(object_store_manager))
-    }
 }
 
 /// Open all regions belong to this datanode.
@@ -447,6 +453,7 @@ async fn open_all_regions(
     region_server: RegionServer,
     table_values: Vec<DatanodeTableValue>,
     open_with_writable: bool,
+    init_regions_parallelism: usize,
 ) -> Result<()> {
     let mut regions = vec![];
     for table_value in table_values {
@@ -467,40 +474,46 @@ async fn open_all_regions(
             ));
         }
     }
-    info!("going to open {} regions", regions.len());
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(OPEN_REGION_PARALLELISM));
-    let mut tasks = vec![];
+    let num_regions = regions.len();
+    info!("going to open {} region(s)", num_regions);
 
-    let region_server_ref = &region_server;
+    let mut region_requests = Vec::with_capacity(regions.len());
     for (region_id, engine, store_path, options) in regions {
         let region_dir = region_dir(&store_path, region_id);
-        let semaphore_moved = semaphore.clone();
-
-        tasks.push(async move {
-            let _permit = semaphore_moved.acquire().await;
-            region_server_ref
-                .handle_request(
-                    region_id,
-                    RegionRequest::Open(RegionOpenRequest {
-                        engine: engine.clone(),
-                        region_dir,
-                        options,
-                        skip_wal_replay: false,
-                    }),
-                )
-                .await?;
-            if open_with_writable {
-                if let Err(e) = region_server_ref.set_writable(region_id, true) {
-                    error!(
-                        e; "failed to set writable for region {region_id}"
-                    );
-                }
-            }
-            Ok(())
-        });
+        region_requests.push((
+            region_id,
+            RegionOpenRequest {
+                engine,
+                region_dir,
+                options,
+                skip_wal_replay: false,
+            },
+        ));
     }
-    let _ = try_join_all(tasks).await?;
 
+    let open_regions = region_server
+        .handle_batch_open_requests(init_regions_parallelism, region_requests)
+        .await?;
+    ensure!(
+        open_regions.len() == num_regions,
+        error::UnexpectedSnafu {
+            violated: format!(
+                "Expected to open {} of regions, only {} of regions has opened",
+                num_regions,
+                open_regions.len()
+            )
+        }
+    );
+
+    for region_id in open_regions {
+        if open_with_writable {
+            if let Err(e) = region_server.set_writable(region_id, true) {
+                error!(
+                    e; "failed to set writable for region {region_id}"
+                );
+            }
+        }
+    }
     info!("all regions are opened");
 
     Ok(())
@@ -516,6 +529,7 @@ mod tests {
     use common_meta::key::datanode_table::DatanodeTableManager;
     use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_meta::kv_backend::KvBackendRef;
+    use mito2::engine::MITO_ENGINE_NAME;
     use store_api::region_request::RegionRequest;
     use store_api::storage::RegionId;
 
@@ -528,7 +542,7 @@ mod tests {
         let txn = mgr
             .build_create_txn(
                 1028,
-                "mock",
+                MITO_ENGINE_NAME,
                 "foo/bar/weny",
                 HashMap::from([("foo".to_string(), "bar".to_string())]),
                 HashMap::default(),
@@ -542,8 +556,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_region_server() {
+        common_telemetry::init_default_ut_logging();
         let mut mock_region_server = mock_region_server();
-        let (mock_region, mut mock_region_handler) = MockRegionEngine::new();
+        let (mock_region, mut mock_region_handler) = MockRegionEngine::new(MITO_ENGINE_NAME);
 
         mock_region_server.register_engine(mock_region.clone());
 

@@ -18,6 +18,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use common_telemetry::{error, info};
 use datatypes::arrow::array::{Float64Array, Int64Array};
 use datatypes::arrow::compute;
@@ -38,7 +39,7 @@ use crate::python::utils::format_py_error;
 #[test]
 fn convert_scalar_to_py_obj_and_back() {
     rustpython_vm::Interpreter::with_init(Default::default(), |vm| {
-        // this can be in `.enter()` closure, but for clearity, put it in the `with_init()`
+        // this can be in `.enter()` closure, but for clarity, put it in the `with_init()`
         let _ = PyVector::make_class(&vm.ctx);
     })
     .enter(|vm| {
@@ -68,18 +69,18 @@ fn convert_scalar_to_py_obj_and_back() {
         } else {
             panic!("Convert errors, expect 1")
         }
-        let col = DFColValue::Scalar(ScalarValue::List(
-            Some(vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(2)),
-            ]),
-            Arc::new(Field::new("item", ArrowDataType::Int64, false)),
-        ));
+        let col = DFColValue::Scalar(ScalarValue::List(ScalarValue::new_list(
+            &[ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))],
+            &ArrowDataType::Int64,
+        )));
         let to = try_into_py_obj(col, vm).unwrap();
         let back = try_into_columnar_value(to, vm).unwrap();
-        if let DFColValue::Scalar(ScalarValue::List(Some(list), field)) = back {
-            assert_eq!(list.len(), 2);
-            assert_eq!(*field.data_type(), ArrowDataType::Int64);
+        if let DFColValue::Scalar(ScalarValue::List(list)) = back {
+            assert_eq!(list.len(), 1);
+            assert_eq!(
+                list.data_type(),
+                &ArrowDataType::List(Arc::new(Field::new_list_field(ArrowDataType::Int64, true)))
+            );
         }
         let list: Vec<PyObjectRef> = vec![vm.ctx.new_int(1).into(), vm.ctx.new_int(2).into()];
         let nested_list: Vec<PyObjectRef> =
@@ -421,7 +422,7 @@ fn test_vm() {
 
     rustpython_vm::Interpreter::with_init(Default::default(), |vm| {
         vm.add_native_module("udf_builtins", Box::new(greptime_builtin::make_module));
-        // this can be in `.enter()` closure, but for clearity, put it in the `with_init()`
+        // this can be in `.enter()` closure, but for clarity, put it in the `with_init()`
         let _ = PyVector::make_class(&vm.ctx);
     })
     .enter(|vm| {
@@ -454,7 +455,6 @@ sin(values)"#,
             }
             Ok(obj) => {
                 let _ser = PyValue::from_py_obj(&obj, vm);
-                dbg!(_ser);
             }
         }
     });

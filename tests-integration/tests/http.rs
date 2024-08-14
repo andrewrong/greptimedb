@@ -14,18 +14,21 @@
 
 use std::collections::BTreeMap;
 
+use api::prom_store::remote::WriteRequest;
 use auth::user_provider_from_option;
 use axum::http::{HeaderName, StatusCode};
-use axum_test_helper::TestClient;
 use common_error::status_code::StatusCode as ErrorCode;
-use serde_json::json;
+use prost::Message;
+use serde_json::{json, Value};
 use servers::http::error_result::ErrorResponse;
 use servers::http::greptime_result_v1::GreptimedbV1Response;
 use servers::http::handler::HealthResponse;
-use servers::http::header::GREPTIME_TIMEZONE_HEADER_NAME;
+use servers::http::header::{GREPTIME_DB_HEADER_NAME, GREPTIME_TIMEZONE_HEADER_NAME};
 use servers::http::influxdb_result_v1::{InfluxdbOutput, InfluxdbV1Response};
 use servers::http::prometheus::{PrometheusJsonResponse, PrometheusResponse};
+use servers::http::test_helpers::TestClient;
 use servers::http::GreptimeQueryOutput;
+use servers::prom_store;
 use tests_integration::test_util::{
     setup_test_http_app, setup_test_http_app_with_frontend,
     setup_test_http_app_with_frontend_and_user_provider, setup_test_prom_app_with_frontend,
@@ -71,6 +74,11 @@ macro_rules! http_tests {
                 test_status_api,
                 test_config_api,
                 test_dashboard_path,
+                test_prometheus_remote_write,
+                test_vm_proto_remote_write,
+
+                test_pipeline_api,
+                test_plain_text_ingestion,
             );
         )*
     };
@@ -142,7 +150,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records" :{"schema":{"column_schemas":[{"name":"number","data_type":"UInt32"}]},"rows":[[0],[1],[2],[3],[4],[5],[6],[7],[8],[9]]}
+            "records" :{"schema":{"column_schemas":[{"name":"number","data_type":"UInt32"}]},"rows":[[0],[1],[2],[3],[4],[5],[6],[7],[8],[9]],"total_rows":10}
         })).unwrap()
     );
 
@@ -184,7 +192,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"host","data_type":"String"},{"name":"cpu","data_type":"Float64"},{"name":"memory","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[["host",66.6,1024.0,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"host","data_type":"String"},{"name":"cpu","data_type":"Float64"},{"name":"memory","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[["host",66.6,1024.0,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -202,7 +210,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -219,7 +227,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"c","data_type":"Float64"},{"name":"time","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"c","data_type":"Float64"},{"name":"time","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -236,13 +244,13 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         outputs[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
     assert_eq!(
         outputs[1],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"rows":[], "schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]}}
+            "records":{"rows":[], "schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]}, "total_rows":0}
         }))
         .unwrap()
     );
@@ -252,12 +260,11 @@ pub async fn test_sql_api(store_type: StorageType) {
         .get("/v1/sql?sql=select cpu, ts from demo limit 1;select cpu, ts from demo2 where ts > 0;")
         .send()
         .await;
-    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     let body = serde_json::from_str::<ErrorResponse>(&res.text().await).unwrap();
-    // TODO(shuiyisong): fix this when return source err msg to client side
     assert!(body.error().contains("Table not found"));
-    assert_eq!(body.code(), ErrorCode::PlanQuery as u32);
+    assert_eq!(body.code(), ErrorCode::TableNotFound as u32);
 
     // test database given
     let res = client
@@ -272,7 +279,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         outputs[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -298,7 +305,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         outputs[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -403,6 +410,22 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .await;
     assert_eq!(res.status(), StatusCode::OK);
 
+    // instant query 1+1
+    let res = client
+        .get("/v1/prometheus/api/v1/query?query=1%2B1&time=1")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(
+            json!({"resultType":"scalar","result":[1.0,"2"]})
+        )
+        .unwrap()
+    );
+
     // range query
     let res = client
         .get("/v1/prometheus/api/v1/query_range?query=up&start=1&end=100&step=5")
@@ -411,6 +434,12 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     assert_eq!(res.status(), StatusCode::OK);
     let res = client
         .post("/v1/prometheus/api/v1/query_range?query=up&start=1&end=100&step=5")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = client
+        .post("/v1/prometheus/api/v1/query_range?query=count(count(up))&start=1&end=100&step=5")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
         .await;
@@ -437,15 +466,19 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     assert_eq!(body.status, "success");
     assert_eq!(
         body.data,
-        serde_json::from_value::<PrometheusResponse>(json!([
-            "__name__", "cpu", "host", "memory", "ts"
-        ]))
-        .unwrap()
+        serde_json::from_value::<PrometheusResponse>(json!(["__name__", "host",])).unwrap()
     );
 
     // labels without match[] param
     let res = client.get("/v1/prometheus/api/v1/labels").send().await;
     assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!(["__name__", "host", "number",]))
+            .unwrap()
+    );
 
     // labels query with multiple match[] params
     let res = client
@@ -462,7 +495,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
 
     // series
     let res = client
-        .get("/v1/prometheus/api/v1/series?match[]=demo&start=0&end=0")
+        .get("/v1/prometheus/api/v1/series?match[]=demo{}&start=0&end=0")
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -478,10 +511,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .collect::<BTreeMap<String, String>>();
     let expected = BTreeMap::from([
         ("__name__".to_string(), "demo".to_string()),
-        ("ts".to_string(), "1970-01-01 00:00:00+0000".to_string()),
-        ("cpu".to_string(), "1.1".to_string()),
         ("host".to_string(), "host1".to_string()),
-        ("memory".to_string(), "2.2".to_string()),
     ]);
     assert_eq!(actual, expected);
 
@@ -490,7 +520,15 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
         .await;
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let prom_resp = res.json::<PrometheusJsonResponse>().await;
+    assert_eq!(prom_resp.status, "error");
+    assert!(prom_resp
+        .error_type
+        .is_some_and(|err| err.eq_ignore_ascii_case("TableNotFound")));
+    assert!(prom_resp
+        .error
+        .is_some_and(|err| err.eq_ignore_ascii_case("Table not found: greptime.public.up")));
 
     // label values
     // should return error if there is no match[]
@@ -498,15 +536,60 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .get("/v1/prometheus/api/v1/label/instance/values")
         .send()
         .await;
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let prom_resp = res.json::<PrometheusJsonResponse>().await;
     assert_eq!(prom_resp.status, "error");
-    assert!(prom_resp.error.is_some_and(|err| !err.is_empty()));
-    assert!(prom_resp.error_type.is_some_and(|err| !err.is_empty()));
+    assert!(prom_resp
+        .error
+        .is_some_and(|err| err.eq_ignore_ascii_case("match[] parameter is required")));
+    assert!(prom_resp
+        .error_type
+        .is_some_and(|err| err.eq_ignore_ascii_case("InvalidArguments")));
 
     // single match[]
     let res = client
         .get("/v1/prometheus/api/v1/label/host/values?match[]=demo&start=0&end=600")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!(["host1", "host2"])).unwrap()
+    );
+
+    // search field name
+    let res = client
+        .get("/v1/prometheus/api/v1/label/__field__/values?match[]=demo")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!(["cpu", "memory"])).unwrap()
+    );
+
+    // query an empty database should return nothing
+    let res = client
+        .get("/v1/prometheus/api/v1/label/host/values?match[]=demo&start=0&end=600")
+        .header(GREPTIME_DB_HEADER_NAME.clone(), "nonexistent")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!([])).unwrap()
+    );
+
+    // db header will be overrode by `db` in param
+    let res = client
+        .get("/v1/prometheus/api/v1/label/host/values?match[]=demo&start=0&end=600&db=public")
+        .header(GREPTIME_DB_HEADER_NAME.clone(), "nonexistent")
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -538,6 +621,15 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     assert_eq!(prom_resp.status, "success");
     assert!(prom_resp.error.is_none());
     assert!(prom_resp.error_type.is_none());
+
+    // buildinfo
+    let res = client
+        .get("/v1/prometheus/api/v1/status/buildinfo")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
 
     guard.remove_all().await;
 }
@@ -596,7 +688,7 @@ def test(n) -> vector[f64]:
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"n","data_type":"Float64"}]},"rows":[[1.0],[2.0],[3.0],[4.0],[5.0],[6.0],[7.0],[8.0],[9.0],[10.0]]}
+            "records":{"schema":{"column_schemas":[{"name":"n","data_type":"Float64"}]},"rows":[[1.0],[2.0],[3.0],[4.0],[5.0],[6.0],[7.0],[8.0],[9.0],[10.0]],"total_rows": 10}
         })).unwrap()
     );
 
@@ -652,103 +744,61 @@ pub async fn test_config_api(store_type: StorageType) {
 
     let expected_toml_str = format!(
         r#"
-[procedure]
-max_retry_times = 3
-retry_delay = "500ms"
-
-[metadata_store]
-file_size = "256MiB"
-purge_threshold = "4GiB"
-
-[frontend]
 mode = "standalone"
+enable_telemetry = true
 
-[frontend.heartbeat]
-interval = "18s"
-retry_interval = "3s"
-
-[frontend.http]
+[http]
 addr = "127.0.0.1:4000"
 timeout = "30s"
 body_limit = "64MiB"
+is_strict_mode = false
 
-[frontend.grpc]
+[grpc]
 addr = "127.0.0.1:4001"
-runtime_size = 8
+hostname = "127.0.0.1"
 max_recv_message_size = "512MiB"
 max_send_message_size = "512MiB"
+runtime_size = 8
 
-[frontend.mysql]
+[grpc.tls]
+mode = "disable"
+cert_path = ""
+key_path = ""
+watch = false
+
+[mysql]
 enable = true
 addr = "127.0.0.1:4002"
 runtime_size = 2
 
-[frontend.mysql.tls]
+[mysql.tls]
 mode = "disable"
 cert_path = ""
 key_path = ""
 watch = false
 
-[frontend.postgres]
+[postgres]
 enable = true
 addr = "127.0.0.1:4003"
 runtime_size = 2
 
-[frontend.postgres.tls]
+[postgres.tls]
 mode = "disable"
 cert_path = ""
 key_path = ""
 watch = false
 
-[frontend.opentsdb]
-enable = true
-addr = "127.0.0.1:4242"
-runtime_size = 2
-
-[frontend.influxdb]
+[opentsdb]
 enable = true
 
-[frontend.prom_store]
+[influxdb]
+enable = true
+
+[prom_store]
 enable = true
 with_metric_engine = true
 
-[frontend.otlp]
-enable = true
-
-[frontend.logging]
-enable_otlp_tracing = false
-append_stdout = true
-
-[frontend.datanode.client]
-timeout = "10s"
-connect_timeout = "1s"
-tcp_nodelay = true
-
-[frontend.export_metrics]
-enable = false
-write_interval = "30s"
-
-[datanode]
-mode = "standalone"
-node_id = 0
-require_lease_before_startup = true
-init_regions_in_background = false
-rpc_addr = "127.0.0.1:3001"
-rpc_runtime_size = 8
-rpc_max_recv_message_size = "512MiB"
-rpc_max_send_message_size = "512MiB"
-enable_telemetry = true
-
-[datanode.heartbeat]
-interval = "3s"
-retry_interval = "3s"
-
-[datanode.http]
-addr = "127.0.0.1:4000"
-timeout = "30s"
-body_limit = "64MiB"
-
-[datanode.wal]
+[wal]
 provider = "raft_engine"
 file_size = "256MiB"
 purge_threshold = "4GiB"
@@ -758,13 +808,25 @@ sync_write = false
 enable_log_recycle = true
 prefill_log_files = false
 
-[datanode.storage]
+[storage]
 type = "{}"
 providers = []
 
-[[datanode.region_engine]]
+[metadata_store]
+file_size = "256MiB"
+purge_threshold = "4GiB"
 
-[datanode.region_engine.mito]
+[procedure]
+max_retry_times = 3
+retry_delay = "500ms"
+
+[logging]
+enable_otlp_tracing = false
+append_stdout = true
+
+[[region_engine]]
+
+[region_engine.mito]
 worker_channel_size = 128
 worker_request_batch_size = 64
 manifest_checkpoint_distance = 10
@@ -774,45 +836,45 @@ auto_flush_interval = "30m"
 enable_experimental_write_cache = false
 experimental_write_cache_path = ""
 experimental_write_cache_size = "512MiB"
+experimental_write_cache_ttl = "1h"
 sst_write_buffer_size = "8MiB"
 parallel_scan_channel_size = 32
 allow_stale_entries = false
 
-[datanode.region_engine.mito.inverted_index]
+[region_engine.mito.index]
+aux_path = ""
+staging_size = "2GiB"
+write_buffer_size = "8MiB"
+
+[region_engine.mito.inverted_index]
 create_on_flush = "auto"
 create_on_compaction = "auto"
 apply_on_query = "auto"
-write_buffer_size = "8MiB"
-mem_threshold_on_create = "64.0MiB"
-intermediate_path = ""
+mem_threshold_on_create = "auto"
 
-[datanode.region_engine.mito.memtable]
-type = "experimental"
-index_max_keys_per_shard = 8192
-data_freeze_threshold = 131072
-dedup = true
-fork_dictionary_bytes = "1GiB"
+[region_engine.mito.fulltext_index]
+create_on_flush = "auto"
+create_on_compaction = "auto"
+apply_on_query = "auto"
+mem_threshold_on_create = "auto"
+compress = true
 
-[[datanode.region_engine]]
+[region_engine.mito.memtable]
+type = "time_series"
 
-[datanode.region_engine.file]
+[[region_engine]]
 
-[datanode.logging]
-enable_otlp_tracing = false
-append_stdout = true
+[region_engine.file]
 
-[datanode.export_metrics]
+[export_metrics]
 enable = false
 write_interval = "30s"
 
-[logging]
-enable_otlp_tracing = false
-append_stdout = true
-
-[wal_meta]
-provider = "raft_engine""#,
-        store_type,
-    );
+[tracing]"#,
+        store_type
+    )
+    .trim()
+    .to_string();
     let body_text = drop_lines_with_inconsistent_results(res_get.text().await);
     assert_eq!(body_text, expected_toml_str);
 }
@@ -836,6 +898,9 @@ fn drop_lines_with_inconsistent_results(input: String) -> String {
         "sst_meta_cache_size =",
         "vector_cache_size =",
         "page_cache_size =",
+        "selector_result_cache_size =",
+        "metadata_cache_size =",
+        "content_cache_size =",
     ];
 
     input
@@ -875,3 +940,304 @@ pub async fn test_dashboard_path(store_type: StorageType) {
 
 #[cfg(not(feature = "dashboard"))]
 pub async fn test_dashboard_path(_: StorageType) {}
+
+pub async fn test_prometheus_remote_write(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_prom_app_with_frontend(store_type, "prometheus_remote_write").await;
+    let client = TestClient::new(app);
+
+    // write snappy encoded data
+    let write_request = WriteRequest {
+        timeseries: prom_store::mock_timeseries(),
+        ..Default::default()
+    };
+    let serialized_request = write_request.encode_to_vec();
+    let compressed_request =
+        prom_store::snappy_compress(&serialized_request).expect("failed to encode snappy");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "snappy")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    guard.remove_all().await;
+}
+
+pub async fn test_vm_proto_remote_write(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_prom_app_with_frontend(store_type, "vm_proto_remote_write").await;
+
+    // handshake
+    let client = TestClient::new(app);
+    let res = client
+        .post("/v1/prometheus/write?get_vm_proto_version=1")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await, "1");
+
+    // write zstd encoded data
+    let write_request = WriteRequest {
+        timeseries: prom_store::mock_timeseries(),
+        ..Default::default()
+    };
+    let serialized_request = write_request.encode_to_vec();
+    let compressed_request =
+        zstd::stream::encode_all(&serialized_request[..], 1).expect("Failed to encode zstd");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "zstd")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // also test fallback logic, vmagent could sent data in wrong content-type
+    // we encode it as zstd but send it as snappy
+    let compressed_request =
+        zstd::stream::encode_all(&serialized_request[..], 1).expect("Failed to encode zstd");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "snappy")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // reversed
+    let compressed_request =
+        prom_store::snappy_compress(&serialized_request[..]).expect("Failed to encode snappy");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "zstd")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    guard.remove_all().await;
+}
+
+pub async fn test_pipeline_api(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) = setup_test_http_app_with_frontend(store_type, "test_pipeline_api").await;
+
+    // handshake
+    let client = TestClient::new(app);
+
+    let body = r#"
+processors:
+  - date:
+      field: time
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+      ignore_missing: true
+
+transform:
+  - fields:
+      - id1
+      - id2
+    type: int32
+  - fields:
+      - type
+      - log
+      - logger
+    type: string
+  - field: time
+    type: time
+    index: timestamp
+"#;
+
+    // 1. create pipeline
+    let res = client
+        .post("/v1/events/pipelines/test")
+        .header("Content-Type", "application/x-yaml")
+        .body(body)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let content = res.text().await;
+
+    let content = serde_json::from_str(&content);
+    assert!(content.is_ok());
+    //  {"execution_time_ms":13,"pipelines":[{"name":"test","version":"2024-07-04 08:31:00.987136"}]}
+    let content: Value = content.unwrap();
+
+    let execution_time = content.get("execution_time_ms");
+    assert!(execution_time.unwrap().is_number());
+    let pipelines = content.get("pipelines");
+    let pipelines = pipelines.unwrap().as_array().unwrap();
+    assert_eq!(pipelines.len(), 1);
+    let pipeline = pipelines.first().unwrap();
+    assert_eq!(pipeline.get("name").unwrap(), "test");
+
+    let version_str = pipeline
+        .get("version")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. write data
+    let data_body = r#"
+[
+  {
+    "id1": "2436",
+    "id2": "2528",
+    "logger": "INTERACT.MANAGER",
+    "type": "I",
+    "time": "2024-05-25 20:16:37.217",
+    "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+  }
+]
+"#;
+    let res = client
+        .post("/v1/events/logs?db=public&table=logs1&pipeline_name=test")
+        .header("Content-Type", "application/json")
+        .body(data_body)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let encoded: String = url::form_urlencoded::byte_serialize(version_str.as_bytes()).collect();
+
+    // 3. remove pipeline
+    let res = client
+        .delete(format!("/v1/events/pipelines/test?version={}", encoded).as_str())
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // {"pipelines":[{"name":"test","version":"2024-07-04 08:55:29.038347"}],"execution_time_ms":22}
+    let content = res.text().await;
+    let content: Value = serde_json::from_str(&content).unwrap();
+    assert!(content.get("execution_time_ms").unwrap().is_number());
+
+    assert_eq!(
+        content.get("pipelines").unwrap().to_string(),
+        format!(r#"[{{"name":"test","version":"{}"}}]"#, version_str).as_str()
+    );
+
+    // 4. write data failed
+    let res = client
+        .post("/v1/events/logs?db=public&table=logs1&pipeline_name=test")
+        .header("Content-Type", "application/json")
+        .body(data_body)
+        .send()
+        .await;
+    // todo(shuiyisong): refactor http error handling
+    assert_ne!(res.status(), StatusCode::OK);
+
+    guard.remove_all().await;
+}
+
+pub async fn test_plain_text_ingestion(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) = setup_test_http_app_with_frontend(store_type, "test_pipeline_api").await;
+
+    // handshake
+    let client = TestClient::new(app);
+
+    let body = r#"
+processors:
+  - dissect:
+      fields:
+        - line
+      patterns:
+        - "%{+ts} %{+ts} %{content}"
+  - date:
+      fields:
+        - ts
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+
+transform:
+  - fields:
+      - content
+    type: string
+  - field: ts
+    type: time
+    index: timestamp
+"#;
+
+    // 1. create pipeline
+    let res = client
+        .post("/v1/events/pipelines/test")
+        .header("Content-Type", "application/x-yaml")
+        .body(body)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let content = res.text().await;
+
+    let content = serde_json::from_str(&content);
+    assert!(content.is_ok());
+    //  {"execution_time_ms":13,"pipelines":[{"name":"test","version":"2024-07-04 08:31:00.987136"}]}
+    let content: Value = content.unwrap();
+
+    let version_str = content
+        .get("pipelines")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .get("version")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!version_str.is_empty());
+
+    // 2. write data
+    let data_body = r#"
+2024-05-25 20:16:37.217 hello
+2024-05-25 20:16:37.218 hello world
+"#;
+    let res = client
+        .post("/v1/events/logs?db=public&table=logs1&pipeline_name=test")
+        .header("Content-Type", "text/plain")
+        .body(data_body)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. select data
+    let res = client.get("/v1/sql?sql=select * from logs1").send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let resp = res.text().await;
+
+    let resp: Value = serde_json::from_str(&resp).unwrap();
+    let v = resp
+        .get("output")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .get("records")
+        .unwrap()
+        .get("rows")
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        v,
+        r#"[["hello",1716668197217000000],["hello world",1716668197218000000]]"#,
+    );
+
+    guard.remove_all().await;
+}

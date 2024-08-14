@@ -21,9 +21,10 @@ use datafusion_common::Column;
 use datafusion_expr::{lit, Expr};
 use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
-use mito2::memtable::merge_tree::{MergeTreeConfig, MergeTreeMemtable};
+use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
 use mito2::memtable::{KeyValues, Memtable};
+use mito2::region::options::MergeMode;
 use mito2::test_util::memtable_util::{self, region_metadata_to_row_schema};
 use rand::rngs::ThreadRng;
 use rand::seq::SliceRandom;
@@ -41,9 +42,9 @@ fn write_rows(c: &mut Criterion) {
 
     // Note that this test only generate one time series.
     let mut group = c.benchmark_group("write");
-    group.bench_function("merge_tree", |b| {
+    group.bench_function("partition_tree", |b| {
         let memtable =
-            MergeTreeMemtable::new(1, metadata.clone(), None, &MergeTreeConfig::default());
+            PartitionTreeMemtable::new(1, metadata.clone(), None, &PartitionTreeConfig::default());
         let kvs =
             memtable_util::build_key_values(&metadata, "hello".to_string(), 42, &timestamps, 1);
         b.iter(|| {
@@ -51,7 +52,7 @@ fn write_rows(c: &mut Criterion) {
         });
     });
     group.bench_function("time_series", |b| {
-        let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None);
+        let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
         let kvs =
             memtable_util::build_key_values(&metadata, "hello".to_string(), 42, &timestamps, 1);
         b.iter(|| {
@@ -63,14 +64,14 @@ fn write_rows(c: &mut Criterion) {
 /// Scans all rows.
 fn full_scan(c: &mut Criterion) {
     let metadata = Arc::new(cpu_metadata());
-    let config = MergeTreeConfig::default();
+    let config = PartitionTreeConfig::default();
     let start_sec = 1710043200;
     let generator = CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 3600 * 2);
 
     let mut group = c.benchmark_group("full_scan");
     group.sample_size(10);
-    group.bench_function("merge_tree", |b| {
-        let memtable = MergeTreeMemtable::new(1, metadata.clone(), None, &config);
+    group.bench_function("partition_tree", |b| {
+        let memtable = PartitionTreeMemtable::new(1, metadata.clone(), None, &config);
         for kvs in generator.iter() {
             memtable.write(&kvs).unwrap();
         }
@@ -83,7 +84,7 @@ fn full_scan(c: &mut Criterion) {
         });
     });
     group.bench_function("time_series", |b| {
-        let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None);
+        let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
         for kvs in generator.iter() {
             memtable.write(&kvs).unwrap();
         }
@@ -100,14 +101,14 @@ fn full_scan(c: &mut Criterion) {
 /// Filters 1 host.
 fn filter_1_host(c: &mut Criterion) {
     let metadata = Arc::new(cpu_metadata());
-    let config = MergeTreeConfig::default();
+    let config = PartitionTreeConfig::default();
     let start_sec = 1710043200;
     let generator = CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 3600 * 2);
 
     let mut group = c.benchmark_group("filter_1_host");
     group.sample_size(10);
-    group.bench_function("merge_tree", |b| {
-        let memtable = MergeTreeMemtable::new(1, metadata.clone(), None, &config);
+    group.bench_function("partition_tree", |b| {
+        let memtable = PartitionTreeMemtable::new(1, metadata.clone(), None, &config);
         for kvs in generator.iter() {
             memtable.write(&kvs).unwrap();
         }
@@ -121,7 +122,7 @@ fn filter_1_host(c: &mut Criterion) {
         });
     });
     group.bench_function("time_series", |b| {
-        let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None);
+        let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
         for kvs in generator.iter() {
             memtable.write(&kvs).unwrap();
         }
@@ -273,7 +274,7 @@ impl CpuDataGenerator {
     fn random_host_filter(&self) -> Predicate {
         let host = self.random_hostname();
         let expr = Expr::Column(Column::from_name("hostname")).eq(lit(host));
-        Predicate::new(vec![expr.into()])
+        Predicate::new(vec![expr])
     }
 
     fn random_hostname(&self) -> String {
